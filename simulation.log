@@ -1,0 +1,177 @@
+2025-05-09 20:40:17,800 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 20:40:17,802 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 20:40:17,812 - WSN_Simulation - ERROR - 主执行过程中发生未捕获的错误: 'WSNEnv' object has no attribute 'config_file_path'
+Traceback (most recent call last):
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\main.py", line 25, in main
+    environment = WSNEnv(config_path=CONFIG_FILE)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\env.py", line 135, in __init__
+    logger.info(f"从 {self.config_file_path} 加载配置。")
+                      ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'WSNEnv' object has no attribute 'config_file_path'
+2025-05-09 20:41:24,570 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 20:41:24,570 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 20:41:24,574 - WSN_Simulation - INFO - 从 {'network': {'node_count': 100, 'area_size': [500, 500], 'base_position': [250, 250], 'seed': 42, 'poisson_disk_min_dist_factor': 0.65, 'poisson_disk_k_samples': 30}, 'energy': {'initial': 1000, 'tx_amp': 0.0013, 'rx_cost': '50e-9', 'data_rate': '250e3', 'threshold_d0': 87.7}, 'q_clustering': {'alpha': 0.2, 'gamma': 0.9, 'epsilon': 0.8, 'state_dim': 5, 'cluster_interval': 100}, 'simulation': {'total_rounds': 1000, 'packet_size': 4000, 'warmup_rounds': 50}, 'visualization': {'update_interval': 50, 'colors': {'cluster_head': '#FF4500', 'normal_node': '#1E90FF', 'base_station': '#32CD32'}}} 加载配置。
+2025-05-09 20:41:24,574 - WSN_Simulation - ERROR - 加载配置时发生未知错误: expected str, bytes or os.PathLike object, not dict
+2025-05-09 20:41:24,574 - WSN_Simulation - ERROR - 主执行过程中发生未捕获的错误: expected str, bytes or os.PathLike object, not dict
+Traceback (most recent call last):
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\main.py", line 25, in main
+    environment = WSNEnv(config_path=CONFIG_FILE)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\env.py", line 137, in __init__
+    with open(self.config, "r", encoding="utf-8") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: expected str, bytes or os.PathLike object, not dict
+2025-05-09 20:42:23,990 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 20:42:23,990 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 20:42:23,994 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 20:42:23,994 - WSN_Simulation - ERROR - 加载配置时发生未知错误: expected str, bytes or os.PathLike object, not dict
+2025-05-09 20:42:23,994 - WSN_Simulation - ERROR - 主执行过程中发生未捕获的错误: expected str, bytes or os.PathLike object, not dict
+Traceback (most recent call last):
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\main.py", line 25, in main
+    environment = WSNEnv(config_path=CONFIG_FILE)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "e:\vscode\VScode project\vs_py\Q_DEEC\src\env.py", line 137, in __init__
+    with open(self.config, "r", encoding="utf-8") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: expected str, bytes or os.PathLike object, not dict
+2025-05-09 20:43:38,228 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 20:43:38,230 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 20:43:38,230 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 20:43:38,232 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 20:43:38,232 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 20:43:38,232 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 20:43:38,234 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 20:43:38,234 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 20:43:38,248 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 110 个点。
+2025-05-09 20:43:38,248 - WSN_Simulation - INFO - 从 110 个生成的点中随机选择 100 个节点。
+2025-05-09 20:43:38,249 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 0.5 J
+2025-05-09 20:43:38,249 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 20:43:38,249 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 20:43:38,249 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 20:43:39,059 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 20:46:51,061 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 20:49:03,734 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 20:49:03,734 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 20:49:03,734 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 20:49:03,738 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 20:49:03,738 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 20:49:03,738 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 20:49:03,738 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 20:49:03,738 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 20:49:03,752 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 110 个点。
+2025-05-09 20:49:03,752 - WSN_Simulation - INFO - 从 110 个生成的点中随机选择 100 个节点。
+2025-05-09 20:49:03,753 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 0.5 J
+2025-05-09 20:49:03,753 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 20:49:03,753 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 20:49:03,753 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 20:49:04,373 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 20:49:13,919 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:22:42,854 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:22:42,854 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:22:42,854 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0 
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:0 
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:22:42,858 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:22:42,860 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:22:42,873 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 102 个点。
+2025-05-09 21:22:42,873 - WSN_Simulation - INFO - 从 102 个生成的点中随机选择 100 个节点。
+2025-05-09 21:22:42,874 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 0.5 J
+2025-05-09 21:22:42,875 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 21:22:42,875 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 21:22:42,875 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 21:22:43,476 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:22:45,695 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:24:27,568 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:24:27,568 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:24:27,570 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:24:27,572 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:24:27,572 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:24:27,574 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0.65 
+2025-05-09 21:24:27,574 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:30 
+2025-05-09 21:24:27,574 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:24:27,574 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:24:27,574 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 104 个点。
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - 从 104 个生成的点中随机选择 100 个节点。
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 0.5 J
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 21:24:27,588 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 21:24:28,190 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:24:30,182 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:25:17,051 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:25:17,051 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:25:17,051 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0.65 
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:30 
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:25:17,055 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:25:17,069 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 98 个点。
+2025-05-09 21:25:17,069 - WSN_Simulation - WARNING - 泊松圆盘采样仅能生成 98 个节点，少于目标数量 100。 这可能是因为对于给定的区域和节点数量，最小距离 (40.31m) 设置过大。 将使用所有已生成的节点，并随机补充不足的节点（如果需要）。
+2025-05-09 21:25:17,069 - WSN_Simulation - INFO - 为 98 个节点设置初始能量: 0.5 J
+2025-05-09 21:25:17,071 - WSN_Simulation - WARNING - 最终生成的节点数量 (98) 与目标数量 (100) 不符。
+2025-05-09 21:25:17,071 - WSN_Simulation - INFO - WSN 环境初始化完成，共 98 个节点。
+2025-05-09 21:25:17,071 - WSN_Simulation - INFO - 可视化包含 98 个节点的网络拓扑...
+2025-05-09 21:25:17,660 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:25:20,082 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:26:15,683 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:26:15,683 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:26:15,683 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0.65 
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:30 
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:26:15,687 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:26:15,702 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 100 个点。
+2025-05-09 21:26:15,702 - WSN_Simulation - INFO - 从 100 个生成的点中随机选择 100 个节点。
+2025-05-09 21:26:15,702 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 0.5 J
+2025-05-09 21:26:15,702 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 21:26:15,703 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 21:26:15,703 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 21:26:16,306 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:26:18,208 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:29:47,179 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:29:47,179 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:29:47,179 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0.65 
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:30 
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:29:47,189 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:29:47,204 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 109 个点。
+2025-05-09 21:29:47,204 - WSN_Simulation - INFO - 从 109 个生成的点中随机选择 100 个节点。
+2025-05-09 21:29:47,204 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: None J
+2025-05-09 21:29:47,204 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 21:29:47,206 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 21:29:47,206 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 21:29:47,809 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:29:49,479 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。
+2025-05-09 21:30:15,165 - WSN_Simulation - INFO - 主程序开始执行...
+2025-05-09 21:30:15,165 - WSN_Simulation - INFO - 使用配置文件: E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml
+2025-05-09 21:30:15,165 - WSN_Simulation - INFO - 从 E:\vscode\VScode project\vs_py\Q_DEEC\config\config.yml 加载配置。
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - 配置加载成功。
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - 开始初始化节点位置和属性...
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - DEFAULT_MIN_DIST_FACTOR:0.65 
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - DEFAULT_K_SAMPLES_BEFORE_REJECTION:30 
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - 目标节点数量: 100, 区域: 500x500m
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - 泊松圆盘采样参数: 最小距离因子 C=0.65, k_samples=30
+2025-05-09 21:30:15,169 - WSN_Simulation - INFO - 计算得到的泊松圆盘采样最小距离 (r): 40.31m
+2025-05-09 21:30:15,185 - WSN_Simulation - INFO - 泊松圆盘采样（最小距离=40.31m, k=30）初步生成了 106 个点。
+2025-05-09 21:30:15,185 - WSN_Simulation - INFO - 从 106 个生成的点中随机选择 100 个节点。
+2025-05-09 21:30:15,186 - WSN_Simulation - INFO - 为 100 个节点设置初始能量: 1 J
+2025-05-09 21:30:15,186 - WSN_Simulation - INFO - 成功初始化 100 个节点。
+2025-05-09 21:30:15,186 - WSN_Simulation - INFO - WSN 环境初始化完成，共 100 个节点。
+2025-05-09 21:30:15,186 - WSN_Simulation - INFO - 可视化包含 100 个节点的网络拓扑...
+2025-05-09 21:30:15,785 - WSN_Simulation - INFO - 网络拓扑可视化已保存到 E:\vscode\VScode project\vs_py\Q_DEEC\reports\network_topology.png
+2025-05-09 21:30:17,213 - WSN_Simulation - INFO - 网络拓扑生成和可视化完成。

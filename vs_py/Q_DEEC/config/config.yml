@@ -1,0 +1,42 @@
+# config/config.yml 基础配置（前两周聚焦）
+
+# 网络拓扑参数
+network:
+  node_count: 100           # 初始节点数量
+  area_size: [500, 500]     # 网络区域尺寸(米)
+  base_position: [250,250]  # 基站坐标
+  seed: 42                  # 随机种子
+  poisson_disk_min_dist_factor: 0.65 # 用于计算最小距离的启发式因子 C (r = sqrt((area * C) / N))
+                                     # 如果注释掉或未提供，env.py 中会使用默认值
+  poisson_disk_k_samples: 30         # Bridson算法中每个激活点的候选采样次数
+                                     # 如果注释掉或未提供，env.py 中会使用默认值
+
+# 能量模型参数
+energy:
+  initial: 1             # 初始能量(J)
+  tx_amp: 0.0013e-12            # 传输放大器能耗系数（一阶模型）
+  rx_cost: 50e-9            # 接收能耗(nJ/bit)
+  data_rate: 250e3          # 数据传输速率(bps)
+  threshold_d0: 87.7        # 距离阈值(自由空间/多径切换)
+
+# Q学习分簇参数
+q_clustering:
+  alpha: 0.2                # 学习率
+  gamma: 0.9                # 折扣因子
+  epsilon: 0.8              # 初始探索率
+  state_dim: 5              # 状态维度（能量/邻居数/距离基站/负载/历史角色）
+  cluster_interval: 100     # 分簇周期(轮)
+  
+# 仿真控制
+simulation:
+  total_rounds: 1000        # 总仿真轮数
+  packet_size: 4000         # 数据包大小(bit)
+  warmup_rounds: 50         # 预热阶段轮数
+
+# 可视化设置
+visualization:
+  update_interval: 50       # 刷新间隔(轮)
+  colors:
+    cluster_head: '#FF4500' # 簇头节点颜色
+    normal_node: '#1E90FF'  # 普通节点颜色
+    base_station: '#32CD32' # 基站颜色
