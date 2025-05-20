@@ -40,3 +40,10 @@ visualization:
     cluster_head: '#FF4500' # 簇头节点颜色
     normal_node: '#1E90FF'  # 普通节点颜色
     base_station: '#32CD32' # 基站颜色
+
+fuzzy:
+  fuzzy_opt:true
+  default_defuzzy_mothod:'centroid'
+  default_AND:'min'
+  default_OR:'max'
+  fuzzy_logger_opt:'all'
