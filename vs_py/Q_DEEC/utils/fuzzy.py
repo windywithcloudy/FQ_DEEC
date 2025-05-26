@@ -375,14 +375,14 @@ if __name__ == '__main__':
     )
     # Pass the specific average send energy for this context
     weights_normal = normal_node_fuzzy_selector.compute_weights(
-        current_dc_base=150, current_e_cluster=0.7, current_p_cluster_actual=12,
+        current_dc_base=80, current_e_cluster=0.7, current_p_cluster_actual=5,
         current_r_success=0.9, current_e_send_total_actual=0.0015,
         avg_e_send_total_for_normal_node=sim_avg_e_send_normal
     )
     print("Normal Node CH Selection Weights:")
     for wn_name, wn_value in weights_normal.items(): # Changed variable names for clarity
         print(f"  {wn_name}: {wn_value:.4f}") # Format to 4 decimal places
-    # normal_node_fuzzy_selector.view_antecedent('d_c_base')
+    #normal_node_fuzzy_selector.view_antecedent('e_cluster')
 
 
     # --- Example for CH to BS Path Selection ---

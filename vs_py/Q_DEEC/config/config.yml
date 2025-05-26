@@ -6,6 +6,7 @@ network:
   area_size: [500, 500]     # 网络区域尺寸(米)
   base_position: [250,250]  # 基站坐标
   seed: 42                  # 随机种子
+  "communication_range": 100 # 从配置读取或默认
   poisson_disk_min_dist_factor: 0.65 # 用于计算最小距离的启发式因子 C (r = sqrt((area * C) / N))
                                      # 如果注释掉或未提供，env.py 中会使用默认值
   poisson_disk_k_samples: 30         # Bridson算法中每个激活点的候选采样次数
@@ -14,22 +15,17 @@ network:
 # 能量模型参数
 energy:
   initial: 1             # 初始能量(J)
-  tx_amp: 0.0013e-12            # 传输放大器能耗系数（一阶模型）
   rx_cost: 50e-9            # 接收能耗(nJ/bit)
+  tx_amp_fs: 10e-12       # 自由空间模型的放大器能量 (epsilon_fs)
+  tx_amp_mp: 0.0013e-12   # 多径衰落模型的放大器能量 (epsilon_mp)
   data_rate: 250e3          # 数据传输速率(bps)
   threshold_d0: 87.7        # 距离阈值(自由空间/多径切换)
-
-# Q学习分簇参数
-q_clustering:
-  alpha: 0.2                # 学习率
-  gamma: 0.9                # 折扣因子
-  epsilon: 0.8              # 初始探索率
-  state_dim: 5              # 状态维度（能量/邻居数/距离基站/负载/历史角色）
-  cluster_interval: 100     # 分簇周期(轮)
+  idle_listening_per_round: 0.000001 # 假设的空闲监听消耗 (J/round)
+  sensing_per_round: 0.0000005       # 假设的感知消耗 (J/round)
   
 # 仿真控制
 simulation:
-  total_rounds: 1000        # 总仿真轮数
+  total_rounds: 2000        # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
 
@@ -47,3 +43,38 @@ fuzzy:
   default_AND:'min'
   default_OR:'max'
   fuzzy_logger_opt:'all'
+
+  # ... 其他配置 ...
+
+# DEEC 协议参数
+deec:
+  p_opt: 0.1                # 期望的簇头百分比 (optimal percentage of CHs)
+  max_comm_range_increase_factor: 1.5 # 普通节点通信范围最大增加倍数
+  min_ch_to_node_ratio_target: 0.05  # 目标最小CH/节点比例，低于此可能增加p_opt
+  # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
+  # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
+                           # 对于初步集成，我们可以简化为每轮都可能重新选举
+
+# A-IoT特性增强参数
+aiot_enhancements:
+  # 创新点1: 节点可用/不可用状态
+  energy_harvesting_enabled: true # 是否启用能量收集模拟
+  min_operational_energy: 0.01    # (J) 维持基本运作的最低能量，低于此可能不可用
+  wakeup_energy_threshold: 0.05   # (J) 从不可用状态唤醒所需的能量阈值
+  energy_harvesting_rate_avg: 0.0001 # (J/轮) 平均能量收集速率 (可以更复杂，如基于时间变化)
+                                      # 如果 harvesting_rate 在节点属性中设置，这里可以不配置
+
+  # 创新点2: 普通节点机会传输
+  normal_node_E_active: 0.15      # (J) 普通节点激活传输决策的能量阈值
+  normal_node_E_safe: 0.1         # (J) 普通节点发送后希望维持的最低安全能量阈值
+
+# ... 其他配置 ...
+
+# 在 visualization: colors: 中添加
+visualization:
+  # ...
+  colors:
+    cluster_head: '#FF4500' 
+    normal_node: '#1E90FF'  
+    base_station: '#32CD32'
+    # dead_node: '#A9A9A9' # 如果需要区分死亡节点颜色

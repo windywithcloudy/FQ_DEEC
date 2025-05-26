@@ -12,11 +12,14 @@ from utils.log import logger # 从 utils 包导入 logger
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_ROOT / "config" / "config.yml"
 OUTPUT_IMAGE_FILE = PROJECT_ROOT / "reports" / "network_topology.png" # 假设输出到 reports 文件夹
+# 输出图像将带有轮次信息
+REPORTS_DIR = PROJECT_ROOT / "reports" / "deec_topology" 
 
 def main():
     logger.info("主程序开始执行...")
     
     # 确保输出图像的目录存在
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True) # 确保报告目录存在
     OUTPUT_IMAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -24,23 +27,29 @@ def main():
         logger.info(f"使用配置文件: {CONFIG_FILE}")
         environment = WSNEnv(config_path=CONFIG_FILE)
         
+        total_rounds = environment.config.get('simulation', {}).get('total_rounds', 10) # 运行少量轮次演示
+        viz_interval = environment.config.get('visualization', {}).get('update_interval', 1)
         # 2. 获取生成的节点数据和配置参数用于可视化
-        nodes_for_viz = environment.nodes # WSNEnv.nodes 存储了节点列表
-        base_station_pos = environment.config['network']['base_position']
-        area_dims = environment.config['network']['area_size']
+            # 可视化当前轮次的分簇结果
+        for r in range(total_rounds):
+            if not environment.step(r): # 执行一轮仿真，包括DEEC选举和分配
+                logger.info(f"仿真在第 {r} 轮提前结束。")
+                break
+            
+            # 可视化当前轮次的分簇结果
+            if (r + 1) % viz_interval == 0 or r == 0 or r == total_rounds -1 : # 首轮、末轮、按间隔可视化
+                output_image_file = REPORTS_DIR / f"network_round_{r+1:04d}.png"
+                visualize_network(
+                    nodes_data=environment.nodes,
+                    base_station_pos=environment.config['network']['base_position'],
+                    area_dims=environment.config['network']['area_size'],
+                    filename=str(output_image_file),
+                    current_round=r + 1,
+                    cluster_heads_ids=environment.cluster_heads, # 传递簇头ID列表
+                    config=environment.config # 传递配置以获取颜色
+                )
         
-        # 3. 可视化网络
-        if nodes_for_viz: # 仅当有节点时才可视化
-            visualize_network(
-                nodes_data=nodes_for_viz,
-                base_station_pos=base_station_pos,
-                area_dims=area_dims,
-                filename=str(OUTPUT_IMAGE_FILE) # 确保是字符串路径
-            )
-        else:
-            logger.info("没有节点可供可视化。")
-
-        logger.info("网络拓扑生成和可视化完成。")
+        logger.info("DEEC分簇仿真演示完成。")
         
         # --- 在这里可以继续您的其他仿真逻辑 ---
         # 例如:
