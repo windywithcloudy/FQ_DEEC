@@ -150,13 +150,19 @@ class WSNEnv:
         # 初始化节点列表（不构建拓扑）
         self.nodes = []
         self.current_round = 0
-        self.cluster_heads = [] # 存储当前轮次的簇头ID
+        self.cluster_heads = []
+        self.candidate_cluster_heads = [] # 重命名: 存储本轮的候选簇头ID
 
         deec_cfg = self.config.get('deec', {})
         self.p_opt_initial = deec_cfg.get('p_opt', 0.1) # 期望的簇头比例
         self.p_opt_current = self.p_opt_initial # 当前轮次使用的p_opt，可以动态调整
         self.max_communication_range_increase_factor = deec_cfg.get('max_comm_range_increase_factor', 1.5) # 允许通信范围增加的最大倍数
         self.min_ch_to_node_ratio_target = deec_cfg.get('min_ch_to_node_ratio', 0.05) # 目标最小簇头与节点比例，用于动态调整p_opt
+        self.location_factor_enabled = deec_cfg.get('location_factor_enabled', False)
+        self.optimal_bs_dist_min = deec_cfg.get('optimal_bs_dist_min', 50)
+        self.optimal_bs_dist_max = deec_cfg.get('optimal_bs_dist_max', 200)
+        self.penalty_factor_too_close = deec_cfg.get('penalty_factor_too_close', 0.5)
+        self.penalty_factor_too_far = deec_cfg.get('penalty_factor_too_far', 0.5)
 
         # E_total_initial 用于DEEC计算，每个节点的初始能量可能不同，DEEC原版假设相同
         # 我们这里假设所有节点的初始能量相同，取第一个节点的初始能量作为参考
@@ -244,132 +250,268 @@ class WSNEnv:
                 alive_nodes_count += 1
         return total_energy / alive_nodes_count if alive_nodes_count > 0 else 0
     
-    def deec_cluster_head_election(self):
-        """执行DEEC协议的簇头选举"""
-        logger.info(f"第 {self.current_round} 轮：开始DEEC簇头选举...")
-        self.cluster_heads = [] # 清空上一轮的簇头
-        for node in self.nodes: # 重置角色
-            if node["status"] == "active":
-                node["role"] = "normal"
-                node["cluster_id"] = -1
-                node["current_communication_range"] = node["base_communication_range"] 
+    def _calculate_location_factor(self, distance_to_bs):
+        """
+        计算基于节点到基站距离的位置因子。
+        Args:
+            distance_to_bs (float): 节点到基站的距离。
+        Returns:
+            float: 位置因子 (0-1]。
+        """
+        if not self.location_factor_enabled:
+            return 1.0 # 如果未启用，则不影响概率
+
+        factor = 1.0
+        # 归一化距离或使用绝对距离进行判断
+        # 这里使用绝对距离判断，参数来自config
+
+        if distance_to_bs < self.optimal_bs_dist_min:
+            # 线性增加：从 penalty_factor_too_close (在d=0时) 到 1 (在 optimal_bs_dist_min 时)
+            # factor = self.penalty_factor_too_close + \
+            #          (1.0 - self.penalty_factor_too_close) * (distance_to_bs / self.optimal_bs_dist_min) \
+            #          if self.optimal_bs_dist_min > 0 else self.penalty_factor_too_close
+            # 或者简单惩罚
+            factor = self.penalty_factor_too_close
+        elif distance_to_bs > self.optimal_bs_dist_max:
+            # 线性减少：从 1 (在 optimal_bs_dist_max 时) 到 penalty_factor_too_far (在网络最大距离时)
+            # network_diagonal = 250 * np.sqrt(2) # 需要获取或定义网络最大可能距离
+            # if distance_to_bs < network_diagonal and network_diagonal > self.optimal_bs_dist_max:
+            #     factor = self.penalty_factor_too_far + \
+            #              (1.0 - self.penalty_factor_too_far) * \
+            #              max(0, (network_diagonal - distance_to_bs) / (network_diagonal - self.optimal_bs_dist_max))
+            # else: # 如果超出网络范围或无法计算斜率
+            #     factor = self.penalty_factor_too_far
+            # 或者简单惩罚
+            factor = self.penalty_factor_too_far
         
+        # 确保因子在合理范围内 (例如，不小于0，不大于1)
+        return max(0.1, min(1.0, factor)) # 最小给个0.1避免完全抑制
+    
+    def deec_candidate_election(self):
+        """
+        执行DEEC协议选举候选簇头，并进行初步的数量和空间分布优化。
+        此阶段不进行成员分配，只确定哪些节点有潜力成为CH。
+        """
+        logger.info(f"第 {self.current_round} 轮：开始DEEC候选簇头选举 (p_opt_current: {self.p_opt_current:.3f})...")
+        self.candidate_cluster_heads = [] # 清空上一轮的候选
+        
+        for node in self.nodes:
+            if node["status"] == "active":
+                 node["cluster_id"] = -1 # 清除上一轮的分配信息
+
         num_alive_nodes = self.get_alive_nodes()
         if num_alive_nodes == 0:
-            logger.info("没有存活节点，无法选举簇头。")
+            logger.info("没有存活节点，无法选举候选簇头。")
             return
 
-        # E_avg_current ( E_bar(r) in DEEC paper)
         current_avg_energy = self._calculate_current_average_energy()
-        if current_avg_energy <= 0: # 防止除零
+        if current_avg_energy <= 0: # 应该在有存活节点时 > 0，但以防万一
             logger.warning("当前网络平均能量为0或负，无法计算DEEC概率。")
-            return
-
-        # 期望成为CH的节点数
-        num_expected_chs_ideal  = self.p_opt_current * num_alive_nodes
-        eligible_nodes_for_ch = [n for n in self.nodes if n["status"] == "active"]
-        
-        # 对每个节点计算其成为CH的概率并选举
-        temp_ch_candidates = []
-        for node in eligible_nodes_for_ch:
-            prob_i = self.p_opt_current * (node["energy"] / current_avg_energy) if current_avg_energy > 0 else 0
-            prob_i = min(1.0, prob_i) if prob_i > 0 else 0
-
-            # 简化：每个合格节点独立以 prob_i 概率成为CH候选
-            # 实际DEEC中，节点成为CH后在一个epoch内通常不再参与选举
-            # 我们这里简化为每轮都可能重新选举，但可以通过 CH_selection_counter 来影响概率（如果需要更复杂的DEEC）
-            if random.random() < prob_i:
-                temp_ch_candidates.append(node["id"])
-        
-        # 如果候选CH数量远超或远少于期望，可以做一些调整
-        # 这里我们先直接使用选出的候选，后续通过assign_nodes_to_clusters后的孤立节点情况来调整p_opt
-        if temp_ch_candidates:
-            # 如果选出的候选过多，可以按能量或其他标准筛选，或随机选取接近期望数量的
-            if len(temp_ch_candidates) > num_expected_chs_ideal * 1.5 and num_expected_chs_ideal > 0:
-                 logger.debug(f"初步选出 {len(temp_ch_candidates)} 个CH候选，多于期望 {num_expected_chs_ideal:.1f}*1.5，将进行筛选。")
-                 # 按能量排序，选能量高的 (或者随机选)
-                 temp_ch_candidates.sort(key=lambda id: self.nodes[id]["energy"], reverse=True)
-                 self.cluster_heads = temp_ch_candidates[:max(1,int(num_expected_chs_ideal * 1.2))] # 保留下限为1，上限为期望的1.2倍
-            else:
-                 self.cluster_heads = temp_ch_candidates
-            
-            for ch_id in self.cluster_heads:
-                self.nodes[ch_id]["role"] = "cluster_head"
-                self.nodes[ch_id]["cluster_id"] = ch_id
-            logger.info(f"DEEC选举完成，共选出 {len(self.cluster_heads)} 个簇头: {self.cluster_heads}")
-        
-        if not self.cluster_heads and num_alive_nodes > 0:
-            logger.warning("本轮未能通过概率选举出任何簇头。")
-            # 强制选择 (保持之前的逻辑)
-            highest_energy_node = max((n for n in self.nodes if n["status"] == "active"), key=lambda x: x["energy"], default=None)
-            if highest_energy_node:
-                highest_energy_node["role"] = "cluster_head"
-                highest_energy_node["cluster_id"] = highest_energy_node["id"]
-                self.cluster_heads.append(highest_energy_node["id"])
-                logger.info(f"强制选择能量最高的节点 {highest_energy_node['id']} 作为簇头。")
-
-        logger.info(f"DEEC选举完成，共选出 {len(self.cluster_heads)} 个簇头: {self.cluster_heads}")
-        if not self.cluster_heads and num_alive_nodes > 0:
-            logger.warning("本轮未能选举出任何簇头。可能需要调整DEEC参数或网络状态不佳。")
-            # 可以考虑强制选择一个能量最高的节点作为CH，以保证网络连通性（如果需要）
+            # 强制选择 (如果需要)
             if num_alive_nodes > 0:
                 highest_energy_node = max((n for n in self.nodes if n["status"] == "active"), key=lambda x: x["energy"], default=None)
                 if highest_energy_node:
-                    highest_energy_node["role"] = "cluster_head"
-                    highest_energy_node["cluster_id"] = highest_energy_node["id"]
-                    self.cluster_heads.append(highest_energy_node["id"])
-                    logger.info(f"强制选择能量最高的节点 {highest_energy_node['id']} 作为簇头。")
+                    self.candidate_cluster_heads.append(highest_energy_node["id"])
+                    logger.info(f"由于平均能量问题，强制选择能量最高的节点 {highest_energy_node['id']} 作为候选簇头。")
+            return
 
-    def assign_nodes_to_clusters(self, attempt=1):
-        if not self.cluster_heads:
-            logger.info("没有簇头可选，节点无法加入簇。")
-            for node in self.nodes:
-                if node["status"] == "active" and node["role"] == "normal":
-                    node["cluster_id"] = -1
-            return len([n for n in self.nodes if n["status"] == "active" and n["role"] == "normal"]) # 返回孤立节点数
-
-        logger.info(f"开始将普通节点分配给簇头 (尝试次数: {attempt})...")
-        num_assigned = 0
-        isolated_nodes_count = 0
-
-        for node_data in self.nodes: # 使用不同的变量名以避免覆盖外部的node
-            if node_data["status"] == "active" and node_data["role"] == "normal":
-                node_data["cluster_id"] = -1 # 每轮尝试前先重置
-                min_dist_to_ch = float('inf')
-                assigned_ch_id = -1
-                
-                # 在当前尝试中，节点使用的通信范围
-                # 第一次尝试使用基础通信范围，后续尝试可以增加
-                current_comm_range = node_data["base_communication_range"]
-                if attempt > 1:
-                    # 简单增加通信范围的策略，可以更精细化
-                    increase_factor = min(1 + (attempt - 1) * 0.25, self.max_communication_range_increase_factor)
-                    current_comm_range = node_data["base_communication_range"] * increase_factor
-                node_data["current_communication_range"] = current_comm_range
-
-
-                for ch_id in self.cluster_heads:
-                    if not (0 <= ch_id < len(self.nodes)) or self.nodes[ch_id]["status"] == "dead":
-                        continue
-                    
-                    distance = self.calculate_distance(node_data["id"], ch_id)
-                    # 节点必须在CH的通信范围内，并且CH也在节点的当前通信范围内
-                    # (简化：假设对称信道，只检查一方是否在另一方的通信范围内即可)
-                    if distance <= node_data["current_communication_range"] and distance <= self.nodes[ch_id]["current_communication_range"]: # CH也用current_communication_range
-                        if distance < min_dist_to_ch:
-                            min_dist_to_ch = distance
-                            assigned_ch_id = ch_id
-                
-                if assigned_ch_id != -1:
-                    node_data["cluster_id"] = assigned_ch_id
-                    num_assigned +=1
-                    # logger.debug(f"节点 {node_data['id']} 加入簇头 {assigned_ch_id} (距离: {min_dist_to_ch:.2f}m, 通信范围: {current_comm_range:.1f}m)。")
-                else:
-                    # logger.debug(f"节点 {node_data['id']} 未能找到可达的簇头加入 (通信范围: {current_comm_range:.1f}m)。")
-                    isolated_nodes_count +=1
+        # 期望的候选簇头数量
+        num_expected_candidates = self.p_opt_current * num_alive_nodes
         
-        logger.info(f"共 {num_assigned} 个普通节点完成了簇分配。剩余孤立节点数: {isolated_nodes_count} (尝试次数: {attempt})")
-        return isolated_nodes_count
+        # 1. 识别不参与CH选举的节点 (例如直连BS的)
+        nodes_for_ch_election_pool = [
+            n for n in self.nodes 
+            if n["status"] == "active" and not n.get("can_connect_bs_directly", False)
+        ]
+        if not nodes_for_ch_election_pool:
+            logger.info("没有符合CH选举资格的节点 (可能都直连BS或死亡)。")
+            self.candidate_cluster_heads = []
+            return
+
+        temp_ch_candidates_ids_prob = []
+        for node in nodes_for_ch_election_pool:
+            base_prob_i = self.p_opt_current * (node["energy"] / current_avg_energy) if current_avg_energy > 0 else 0
+            
+            # 计算并应用位置因子
+            distance_to_bs = self.calculate_distance2_bs(node["id"])
+            location_f = self._calculate_location_factor(distance_to_bs)
+            
+            final_prob_i = base_prob_i * location_f
+            final_prob_i = min(1.0, max(0.0, final_prob_i)) # 确保概率在 [0,1]
+            
+            logger.debug(f"节点 {node['id']}: E={node['energy']:.2f}, d_bs={distance_to_bs:.1f}, base_P={base_prob_i:.3f}, loc_F={location_f:.2f}, final_P={final_prob_i:.3f}")
+
+            if random.random() < final_prob_i:
+                temp_ch_candidates_ids_prob.append(node["id"])
+        
+        logger.debug(f"DEEC概率选举 (含位置因子)：初步产生 {len(temp_ch_candidates_ids_prob)} 个候选CH意向: {temp_ch_candidates_ids_prob}")
+
+        # 2. 如果有候选，进行数量和能量筛选
+        current_candidates_after_initial_filter = []
+        if temp_ch_candidates_ids_prob: 
+            temp_ch_candidates_ids_prob.sort(key=lambda id_val: self.nodes[id_val]["energy"], reverse=True)
+            # 调整期望候选数量的计算基数，应为参与选举的节点数
+            num_eligible_for_election = len(nodes_for_ch_election_pool)
+            effective_expected_candidates = self.p_opt_current * num_eligible_for_election
+
+            max_chs_to_select = max(1, int(effective_expected_candidates * 1.5)) 
+            current_candidates_after_initial_filter = temp_ch_candidates_ids_prob[:max_chs_to_select]
+            if len(temp_ch_candidates_ids_prob) > max_chs_to_select:
+                 logger.debug(f"候选CH过多，筛选至 {len(current_candidates_after_initial_filter)} 个 (按能量)。")
+
+
+        # 3. 基于距离的冗余候选CH移除 (空间分布优化)
+        final_refined_candidates = []
+        if current_candidates_after_initial_filter:
+            # d_min_ch_dist 可以从配置读取或设为固定值
+            # 确保 communication_range 是数字
+            comm_range = self.config.get('network', {}).get('communication_range', 100.0)
+            if not isinstance(comm_range, (int, float)): comm_range = 100.0 # fallback
+            
+            min_ch_dist_factor = self.config.get('deec', {}).get('min_inter_ch_distance_factor', 0.5)
+            d_min_ch_dist = min_ch_dist_factor * comm_range
+            logger.debug(f"空间分布优化：最小CH间距 d_min_ch_dist = {d_min_ch_dist:.2f}m")
+
+            # 候选者已经按能量排序过了，所以能量高的会先进入 final_refined_candidates
+            for cand_id in current_candidates_after_initial_filter:
+                node_cand = self.nodes[cand_id]
+                # 确保节点仍是活跃的 (虽然eligible_nodes_for_ch应该已经筛选过了)
+                if node_cand["status"] != "active": 
+                    continue
+
+                is_too_close = False
+                for final_cand_id in final_refined_candidates:
+                    # final_cand_id 已经是活跃的，因为它被加入了 final_refined_candidates
+                    dist = self.calculate_distance(cand_id, final_cand_id)
+                    if dist < d_min_ch_dist:
+                        is_too_close = True
+                        logger.debug(f"候选CH {cand_id} (能量 {node_cand['energy']:.2f}) 因与已选最终候选 {final_cand_id} 距离 ({dist:.2f}m) 过近 (<{d_min_ch_dist:.2f}m) 而被考虑移除。")
+                        break
+                if not is_too_close:
+                    final_refined_candidates.append(cand_id)
+            
+            self.candidate_cluster_heads = final_refined_candidates
+            logger.info(f"DEEC选举：初步筛选剩 {len(current_candidates_after_initial_filter)} 个，距离优化后最终 {len(self.candidate_cluster_heads)} 个候选CH: {self.candidate_cluster_heads}")
+        else: # 如果 initial filter 后就没有候选了
+            self.candidate_cluster_heads = []
+
+
+        # 4. 如果最终没有选出任何候选CH，则强制选择一个
+        if not self.candidate_cluster_heads and num_alive_nodes > 0:
+            logger.warning("本轮未能通过DEEC（包括优化）选出任何候选簇头。")
+            highest_energy_node = None
+            max_energy = -1
+            for node_data_val in self.nodes: # 使用不同的变量名
+                if node_data_val["status"] == "active" and node_data_val["energy"] > max_energy:
+                    max_energy = node_data_val["energy"]
+                    highest_energy_node = node_data_val
+            
+            if highest_energy_node:
+                self.candidate_cluster_heads.append(highest_energy_node["id"])
+                logger.info(f"强制选择能量最高的节点 {highest_energy_node['id']} (能量 {highest_energy_node['energy']:.2f}J) 作为候选簇头。")
+            else:
+                logger.error("严重错误：有存活节点但无法找到能量最高的节点进行强制CH选择。")
+
+    def identify_direct_bs_nodes(self):
+        """识别可以直接与基站通信的节点"""
+        direct_comm_threshold = self.config.get('network', {}).get('direct_bs_comm_threshold', 50)
+        # min_energy_for_direct_bs = self.config.get('energy', {}).get('min_energy_direct_bs', self.E0 * 0.1)
+        # 使用浮动比例或绝对值，确保E0被正确初始化
+        initial_e = self.E0 if hasattr(self, 'E0') and self.E0 > 0 else self.config.get('energy', {}).get('initial', 1.0)
+        min_energy_for_direct_bs = self.config.get('energy', {}).get('min_energy_direct_bs_factor', 0.1) * initial_e
+
+
+        count_direct = 0
+        for node in self.nodes:
+            if node["status"] == "active":
+                node["can_connect_bs_directly"] = False # 每轮重置
+                node["role_override"] = None         # 重置角色覆盖
+
+                d_to_bs = self.calculate_distance2_bs(node["id"])
+                if d_to_bs <= direct_comm_threshold and node["energy"] > min_energy_for_direct_bs:
+                    node["can_connect_bs_directly"] = True
+                    node["role_override"] = "direct_to_bs" 
+                    node["cluster_id"] = -2 # 特殊标记，表示直连BS
+                    count_direct +=1
+        if count_direct > 0:
+            logger.info(f"识别出 {count_direct} 个节点将直接与BS通信。")
+    
+    
+    def assign_nodes_to_clusters(self, attempt=1, nodes_to_assign=None, candidate_chs=None):
+        """
+        辅助函数：尝试将指定的普通节点分配给指定的候选簇头。
+        主要用于Q学习选择失败后的备用策略或特定场景。
+        """
+        if nodes_to_assign is None: # 默认处理所有未分配的普通节点
+            nodes_to_assign = [n for n in self.nodes if n["status"] == "active" and n["role"] == "normal" and n["cluster_id"] == -1]
+        
+        if candidate_chs is None: # 默认使用本轮的候选CH
+            candidate_chs = self.candidate_cluster_heads
+
+        if not candidate_chs:
+            logger.info(f"Assign attempt {attempt}: 没有候选簇头，节点无法加入簇。")
+            return len(nodes_to_assign) 
+
+        logger.info(f"Assign attempt {attempt}: 开始将 {len(nodes_to_assign)} 个普通节点分配给 {len(candidate_chs)} 个候选簇头...")
+        num_newly_assigned_this_attempt = 0
+        
+        for node_data in nodes_to_assign:
+            if node_data["cluster_id"] != -1: continue # 如果已经被分配（可能通过Q学习），则跳过
+
+            min_dist_to_ch = float('inf')
+            assigned_ch_id = -1
+            
+            current_comm_range = node_data["base_communication_range"]
+            if attempt > 1:
+                increase_factor = min(1 + (attempt - 1) * 0.25, self.max_communication_range_increase_factor)
+                current_comm_range = node_data["base_communication_range"] * increase_factor
+            node_data["current_communication_range"] = current_comm_range
+
+            for ch_id in candidate_chs:
+                if not (0 <= ch_id < len(self.nodes)) or self.nodes[ch_id]["status"] == "dead":
+                    continue
+                # 候选CH也应该使用其当前通信范围（尽管在DEEC选举阶段可能还没特殊调整）
+                if self.nodes[ch_id]["id"] not in self.candidate_cluster_heads : continue # 确保是候选CH
+
+                distance = self.calculate_distance(node_data["id"], ch_id)
+                if distance <= node_data["current_communication_range"] and \
+                   distance <= self.nodes[ch_id]["current_communication_range"]:
+                    if distance < min_dist_to_ch:
+                        min_dist_to_ch = distance
+                        assigned_ch_id = ch_id
+            
+            if assigned_ch_id != -1:
+                node_data["cluster_id"] = assigned_ch_id
+                # node_data["role"] = "member" # 可以有一个更细致的角色
+                num_newly_assigned_this_attempt +=1
+        
+        remaining_isolated = len([n for n in nodes_to_assign if n["cluster_id"] == -1])
+        logger.info(f"Assign attempt {attempt}: 新分配了 {num_newly_assigned_this_attempt} 个节点。仍有 {remaining_isolated} 个来自输入列表的节点未分配。")
+        return remaining_isolated
+    
+    def adjust_p_opt_for_next_round(self, isolated_normal_nodes_after_q_learning):
+        """根据本轮Q学习分配后的孤立普通节点情况和候选CH数量，调整下一轮的p_opt_current"""
+        num_alive = self.get_alive_nodes()
+        if num_alive == 0: return
+
+        # 调整p_opt的逻辑，现在基于候选CH的数量和Q学习分配后的结果
+        num_candidates = len(self.candidate_cluster_heads)
+        expected_candidates = self.p_opt_initial * num_alive # 基于初始p_opt的期望
+
+        if num_candidates < expected_candidates * 0.5 or isolated_normal_nodes_after_q_learning > num_alive * 0.1:
+            # 如果候选CH太少，或者Q学习后孤立节点太多，增加p_opt
+            self.p_opt_current = min(self.p_opt_initial * 2.0, self.p_opt_current * 1.15, 0.35)
+            logger.info(f"由于候选CH不足或Q学习后孤立节点多，下一轮 p_opt 调整为: {self.p_opt_current:.3f}")
+        elif num_candidates > expected_candidates * 1.8:
+            # 如果候选CH过多
+            self.p_opt_current = max(self.p_opt_initial * 0.7, self.p_opt_current * 0.90)
+            logger.info(f"由于候选CH过多，下一轮 p_opt 调整为: {self.p_opt_current:.3f}")
+        else:
+            # 逐渐恢复到初始p_opt
+            if self.p_opt_current > self.p_opt_initial:
+                self.p_opt_current = max(self.p_opt_initial, self.p_opt_current * 0.98)
+            elif self.p_opt_current < self.p_opt_initial:
+                self.p_opt_current = min(self.p_opt_initial, self.p_opt_current * 1.02)
     
     def handle_isolated_nodes(self):
         """处理孤立节点，尝试增加通信范围或调整p_opt"""
@@ -407,20 +549,33 @@ class WSNEnv:
     def simulate_round_energy_consumption(self):
         """模拟一轮中由于基本操作（如感知、空闲监听）产生的能量消耗"""
         # 这是一个非常简化的模型，你可以根据需要调整
-        idle_listening_cost_per_round = self.config.get('energy',{}).get('idle_listening_per_round', 1e-5) # J
-        sensing_cost_per_round = self.config.get('energy',{}).get('sensing_per_round', 5e-6) # J
+        energy_cfg = self.config.get('energy', {})
+        try:
+            idle_listening_cost_per_round = float(energy_cfg.get('idle_listening_per_round', 1e-5))
+            sensing_cost_per_round = float(energy_cfg.get('sensing_per_round', 5e-6))
+        except (ValueError, TypeError):
+            logger.error("配置文件中的 idle_listening_per_round 或 sensing_per_round 不是有效的数字。请检查 config.yml。")
+            idle_listening_cost_per_round = 1e-5
+            sensing_cost_per_round = 5e-6
         
         nodes_to_kill_this_round = []
         for node in self.nodes:
             if node["status"] == "active":
                 cost = idle_listening_cost_per_round + sensing_cost_per_round
+                if not isinstance(node["energy"], (int, float)): 
+                    logger.warning(f"节点 {node['id']} 的能量值类型不正确: {node['energy']} (类型: {type(node['energy'])}). 跳过能耗计算。")
+                    continue
+                if not isinstance(cost, (int, float)): 
+                    logger.warning(f"计算得到的能耗 cost 类型不正确: {cost} (类型: {type(cost)}). 跳过能耗计算。")
+                    continue
+                
                 node["energy"] -= cost
                 if node["energy"] < 0:
                     node["energy"] = 0
-                    nodes_to_kill_this_round.append(node["id"]) # 先记录，后处理，避免在迭代中修改列表导致问题
+                    nodes_to_kill_this_round.append(node["id"])
         
         for node_id in nodes_to_kill_this_round:
-            if self.nodes[node_id]["status"] == "active": # 再次确认，防止重复kill
+            if self.nodes[node_id]["status"] == "active":
                  self.kill_node(node_id)
         
     def calculate_distance(self, node1_idx, node2_idx):
@@ -431,6 +586,11 @@ class WSNEnv:
         x1, y1 = node1["position"]
         x2, y2 = node2["position"]
         return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+    
+    def calculate_distance2_bs(self, node1_idx):
+        node1 = self.nodes[node1_idx]
+        x1, y1 = node1["position"]
+        return ((x1 - 250) ** 2 + (y1 - 250) ** 2) ** 0.5
 
     def update_energy(self, node_id, distance, is_tx=True):
         """
@@ -524,7 +684,7 @@ class WSNEnv:
         return total_energy
     
     def get_alive_nodes(self):
-        logger.info("get_alive_nodes")
+        #logger.info("get_alive_nodes")
         alive_nodes = 0
         for node in self.nodes:
             if node["status"] != "dead":
@@ -547,42 +707,120 @@ class WSNEnv:
         """执行一个仿真轮次的逻辑"""
         self.current_round = current_round_num
         logger.info(f"--- 开始第 {self.current_round} 轮 ---")
-
+        self.identify_direct_bs_nodes()
         for node in self.nodes:
             if node["status"] == "active":
                  node["current_communication_range"] = node["base_communication_range"]
-        # 1. DEEC簇头选举
-        self.deec_cluster_head_election()
-
-        # 2. 普通节点加入簇 (简化为选择最近的CH)
-        if self.cluster_heads:
-            self.handle_isolated_nodes() # 这个函数内部会调用 assign_nodes_to_clusters 多次
-        else:
-            logger.warning(f"第 {self.current_round} 轮：没有簇头，所有活跃节点均为孤立。")
-            # 如果没有CH，可以考虑下一轮增加p_opt
-            self.p_opt_current = min(self.p_opt_initial * 1.5, self.p_opt_current * 1.2, 0.3)
-            logger.info(f"由于没有CH选出，下一轮 p_opt 调整为: {self.p_opt_current:.3f}")
-
-
-        # --- 后续可以添加数据传输、Q学习决策等逻辑 ---
-        # 例如，普通节点基于Q学习选择CH (如果DEEC只是提供了候选)
-        # CH基于Q学习选择下一跳等
-
-        # 模拟能量消耗 (非常简化，实际应基于具体操作)
-        # for node_data in self.nodes:
-        #     if node_data["status"] == "active":
-        #         # 假设每个节点每轮都有一些基础消耗或操作消耗
-        #         # self.update_energy(node_data["id"], distance=10, is_tx=True) # 示例性消耗
-        #         pass
         
+        
+        # 1. DEEC簇头选举
+        self.deec_candidate_election()
+
+        # === 阶段2: 普通节点使用Q学习选择簇头 ===
+        logger.info("开始阶段2：普通节点Q学习选择簇头...")
+        num_nodes_assigned_by_q_learning = 0
+        if self.candidate_cluster_heads:
+            for node_data in self.nodes:
+                if node_data["status"] == "active" and node_data["role"] == "normal":
+                    # TODO: 在这里集成普通节点的Q学习选择CH的逻辑
+                    # 1. 获取该普通节点的Q学习Agent (或模糊Q学习系统实例)
+                    # 2. 普通节点感知 self.candidate_cluster_heads 列表中的候选CH
+                    # 3. 对每个候选CH，收集其状态信息，调用模糊逻辑得到权重
+                    # 4. 计算选择该候选CH的Q值或即时奖励
+                    # 5. 根据Q值和探索策略选择一个CH
+                    # 6. 如果选择了CH，则 node_data["cluster_id"] = chosen_ch_id
+                    #    num_nodes_assigned_by_q_learning += 1
+                    #    被选中的CH的负载信息需要更新 (如果Q学习或模糊逻辑的输入包含负载)
+                    
+                    # ---- 临时占位符：随机选择一个可达的候选CH ----
+                    # ---- 你需要用你的Q学习逻辑替换这里 ----
+                    eligible_chs_for_node = []
+                    for ch_id in self.candidate_cluster_heads:
+                        if self.nodes[ch_id]["status"] == "active": #确保候选CH是活的
+                            distance = self.calculate_distance(node_data["id"], ch_id)
+                            if distance <= node_data["current_communication_range"] and \
+                               distance <= self.nodes[ch_id]["current_communication_range"]:
+                                eligible_chs_for_node.append(ch_id)
+                    if eligible_chs_for_node:
+                        chosen_ch_id = random.choice(eligible_chs_for_node)
+                        node_data["cluster_id"] = chosen_ch_id
+                        num_nodes_assigned_by_q_learning +=1
+                        logger.debug(f"节点 {node_data['id']} (Q学习占位符-随机)选择了候选CH {chosen_ch_id}")
+                    else:
+                        logger.debug(f"节点 {node_data['id']} (Q学习占位符) 未能找到可达的候选CH。")
+                    # ---- Q学习占位符结束 ----
+            logger.info(f"Q学习选择阶段：{num_nodes_assigned_by_q_learning} 个节点尝试了选择CH。")
+        else:
+            logger.warning(f"第 {self.current_round} 轮：没有候选簇头，普通节点无法通过Q学习选择。")
+
+        # 确定最终的CH列表 (那些至少有一个成员通过Q学习加入的候选CH，或者所有候选CH都算？)
+        # 简单起见，我们先假设所有被选为候选的，并且仍然存活的，就是本轮的活跃CH
+        # 但实际上，如果一个候选CH没有吸引到任何成员，它可能不应该扮演CH的角色消耗能量
+        # 这一步的逻辑需要根据你的协议设计来确定。
+        # 我们可以统计哪些候选CH被普通节点选择了：
+        final_active_chs_ids = set()
+        for node_data in self.nodes:
+            if node_data["status"] == "active" and node_data["role"] == "normal" and node_data["cluster_id"] != -1:
+                final_active_chs_ids.add(node_data["cluster_id"])
+        
+        # 更新节点的role，只有被选中的候选CH才最终成为"cluster_head"
+        for node_data in self.nodes:
+            if node_data["id"] in final_active_chs_ids and node_data["status"] == "active":
+                node_data["role"] = "cluster_head"
+            elif node_data["status"] == "active": # 其他活节点（包括未被选为CH的候选者）都是普通节点
+                node_data["role"] = "normal"
+        
+        logger.info(f"Q学习分配后，最终活跃簇头 ({len(final_active_chs_ids)}个): {list(final_active_chs_ids)}")
+
+
+        # === 阶段2之后: 处理仍然孤立的普通节点 ===
+        isolated_normal_nodes_after_q_learning = 0
+        nodes_needing_assignment_after_q = []
+        for node_data in self.nodes:
+            if node_data["status"] == "active" and node_data["role"] == "normal" and node_data["cluster_id"] == -1:
+                isolated_normal_nodes_after_q_learning += 1
+                nodes_needing_assignment_after_q.append(node_data)
+        
+        logger.info(f"Q学习选择后，有 {isolated_normal_nodes_after_q_learning} 个普通节点仍然孤立。")
+
+        if isolated_normal_nodes_after_q_learning > 0 and final_active_chs_ids: # 只有当有孤立节点且有活跃CH时才尝试
+            # 尝试使用增加通信范围的 assign_nodes_to_clusters 作为备用策略
+            max_backup_attempts = 2 # 最多额外尝试2次
+            for attempt in range(1, max_backup_attempts + 1):
+                logger.info(f"对Q学习后孤立的节点进行第 {attempt} 次备用分配尝试...")
+                # 只对仍然孤立的节点进行操作，使用最终活跃的CH作为候选
+                newly_isolated_after_this_attempt = self.assign_nodes_to_clusters(
+                    attempt=attempt + 1, # attempt参数控制通信范围增加，所以从2开始
+                    nodes_to_assign=[n for n in nodes_needing_assignment_after_q if n["cluster_id"] == -1],
+                    candidate_chs=list(final_active_chs_ids)
+                )
+                if newly_isolated_after_this_attempt == 0:
+                    logger.info("所有Q学习后孤立的节点已通过备用策略分配。")
+                    break
+            isolated_normal_nodes_after_q_learning = newly_isolated_after_this_attempt
+
+
+        # === 阶段3: CH使用Q学习选择下一跳 (TODO) ===
+        # for ch_id in final_active_chs_ids:
+        #     # CH节点执行其Q学习逻辑选择下一跳...
+        #     pass
+
+        # --- 数据传输模拟 (TODO) ---
+        
+        # 调整下一轮的p_opt
+        self.adjust_p_opt_for_next_round(isolated_normal_nodes_after_q_learning)
+        
+        # 模拟本轮的基础能量消耗
         self.simulate_round_energy_consumption()
+        
         logger.info(f"--- 第 {self.current_round} 轮结束 ---")
         alive_nodes = self.get_alive_nodes()
-        logger.info(f"轮次结束时存活节点数: {alive_nodes}")
+        final_ch_count_this_round = len([n for n in self.nodes if n["status"]=="active" and n["role"]=="cluster_head"])
+        logger.info(f"轮次结束时存活节点数: {alive_nodes}, 最终活跃CH数: {final_ch_count_this_round}")
         if alive_nodes == 0:
             logger.info("所有节点已死亡，仿真可以提前结束。")
-            return False # 返回False表示仿真可以结束
-        return True # 返回True表示仿真继续
+            return False 
+        return True
 
     def _get_packet_loss_rate(self, distance):
         """基于距离的Log-normal阴影模型"""

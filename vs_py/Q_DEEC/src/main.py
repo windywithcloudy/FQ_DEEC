@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import sys
+import shutil
+
 sys.path.append(str(Path(__file__).parent.parent))
 from env import WSNEnv # 从同级目录的 env.py 导入 WSNEnv
 from utils.virtual import visualize_network # 从 utils 包导入可视化函数
@@ -18,9 +20,19 @@ REPORTS_DIR = PROJECT_ROOT / "reports" / "deec_topology"
 def main():
     logger.info("主程序开始执行...")
     
-    # 确保输出图像的目录存在
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True) # 确保报告目录存在
-    OUTPUT_IMAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # --- 清理操作开始 ---
+    if REPORTS_DIR.exists(): # 检查目录是否存在
+        try:
+            shutil.rmtree(REPORTS_DIR) # 删除整个目录及其内容
+            logger.info(f"已删除旧的报告目录: {REPORTS_DIR}")
+        except OSError as e: # 处理可能的删除错误，例如文件被占用
+            logger.error(f"删除目录 {REPORTS_DIR} 失败: {e}")
+            # 可以选择在这里退出或继续（但后续保存可能会失败或写入旧目录）
+            # return 
+    # --- 清理操作结束 ---
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True) # 重新创建报告目录
+    logger.info(f"已创建报告目录: {REPORTS_DIR}")
 
     try:
         # 1. 初始化环境 (这将自动加载配置并初始化节点)
@@ -45,8 +57,8 @@ def main():
                     area_dims=environment.config['network']['area_size'],
                     filename=str(output_image_file),
                     current_round=r + 1,
-                    cluster_heads_ids=environment.cluster_heads, # 传递簇头ID列表
-                    config=environment.config # 传递配置以获取颜色
+                    candidate_ch_ids=environment.candidate_cluster_heads, # 传递候选CH ID
+                    config=environment.config 
                 )
         
         logger.info("DEEC分簇仿真演示完成。")
