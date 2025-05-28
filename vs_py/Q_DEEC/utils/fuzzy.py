@@ -3,6 +3,15 @@ import skfuzzy as fuzz
 from skfuzzy import control as ctrl
 import matplotlib.pyplot as plt # Keep for viewing, can be commented out for production
 
+import logging # 使用标准logging
+logger = logging.getLogger(__name__) # 创建一个本地logger
+if not logger.handlers: # 防止重复添加handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
 # =============================================================================
 # Fuzzy System for Normal Node Selecting a Cluster Head (CH)
 # =============================================================================
@@ -358,7 +367,211 @@ class CHToBSPathSelectionFuzzySystem:
             plt.show(block=True)
         else: print(f"Consequent {name} not found or not initialized.")
 
+class RewardWeightsFuzzySystemForCHCompetition:
+    def __init__(self, main_sim_config): # 传入整个主仿真config
+        """
+        Initializes the fuzzy system for adjusting CH competition reward weights.
+        """
+        self.main_config = main_sim_config # 保存主配置的引用
+        self.fuzzy_specific_config = self.main_config.get('fuzzy', {})
+        
+        # 从specific_config或main_config中获取p_opt_ref
+        # 这个 p_opt_reference 用于定义 ch_density_global 的模糊集
+        self.p_opt_reference = float(self.main_config.get('deec', {}).get('p_opt', 0.1)
+                                          )
+        logger.debug(f"RewardWeightsFuzzySystem: p_opt_reference set to {self.p_opt_reference}")
 
+        # --- Antecedents (Inputs) ---
+        self.network_energy_level = None
+        self.node_self_energy = None
+        self.ch_density_global = None
+        self.ch_to_bs_dis = None
+
+        # --- Consequents (Outputs) ---
+        self.w_members_factor = None
+        self.w_energy_self_factor = None
+        self.w_cost_ch_factor = None
+        self.w_rotation_factor = None
+        self.w_dis = None
+
+        # --- Define MFs and Rules once ---
+        self._define_antecedents_and_consequents_once()
+        self.rules = self._define_rules_once() # Store rules list as an attribute
+
+        # ControlSystem will be created once, Simulation will be created per compute call
+        if not self.rules:
+            logger.error("RewardWeightsFuzzySystem: No rules defined! System will not work.")
+            self.control_system = None # Mark as not built
+        else:
+            self.control_system = ctrl.ControlSystem(self.rules)
+            logger.info("RewardWeightsFuzzySystem: ControlSystem built successfully.")
+
+
+    def _define_antecedents_and_consequents_once(self):
+        logger.debug("Defining antecedents and consequents for RewardWeightsFuzzySystem...")
+        # 1. Network_Energy_Level (归一化 [0,1])
+        universe_net_energy = np.arange(0, 1.01, 0.01)
+        self.network_energy_level = ctrl.Antecedent(universe_net_energy, 'network_energy_level')
+        self.network_energy_level['Low'] = fuzz.zmf(self.network_energy_level.universe, 0.2, 0.4)
+        self.network_energy_level['Medium'] = fuzz.trimf(self.network_energy_level.universe, [0.3, 0.6, 0.8])
+        self.network_energy_level['High'] = fuzz.smf(self.network_energy_level.universe, 0.7, 0.9)
+
+        # 2. Node_Self_Energy (归一化 [0,1])
+        universe_self_energy = np.arange(0, 1.01, 0.01)
+        self.node_self_energy = ctrl.Antecedent(universe_self_energy, 'node_self_energy')
+        self.node_self_energy['Low'] = fuzz.zmf(self.node_self_energy.universe, 0.2, 0.4)
+        self.node_self_energy['Medium'] = fuzz.trimf(self.node_self_energy.universe, [0.3, 0.5, 0.7])
+        self.node_self_energy['High'] = fuzz.smf(self.node_self_energy.universe, 0.6, 0.8)
+
+        # 3. CH_Density_Global
+        p_opt = self.p_opt_reference 
+        universe_ch_density = np.arange(0, p_opt * 3 + 0.01, 0.01)
+        self.ch_density_global = ctrl.Antecedent(universe_ch_density, 'ch_density_global')
+        self.ch_density_global['Too_Low'] = fuzz.zmf(self.ch_density_global.universe, p_opt * 0.5, p_opt * 0.8)
+        self.ch_density_global['Optimal'] = fuzz.trimf(self.ch_density_global.universe, [p_opt * 0.7, p_opt, p_opt * 1.3])
+        self.ch_density_global['Too_High'] = fuzz.smf(self.ch_density_global.universe, p_opt * 1.2, p_opt * 1.5)
+
+        # 4. CH_to_BS_Distance (节点到BS的归一化距离 [0,1])
+        universe_distance = np.arange(0, 1.01, 0.01)
+        self.ch_to_bs_dis = ctrl.Antecedent(universe_distance, 'ch_to_bs_dis')
+        self.ch_to_bs_dis['Low'] = fuzz.zmf(self.ch_to_bs_dis.universe, 0.20, 0.30) 
+        self.ch_to_bs_dis['Medium'] = fuzz.trimf(self.ch_to_bs_dis.universe, [0.25, 0.5, 0.75])
+        self.ch_to_bs_dis['High'] = fuzz.smf(self.ch_to_bs_dis.universe, 0.70, 0.80)
+
+        # --- Consequents ---
+        universe_factors = np.arange(0.5, 1.51, 0.01) 
+        self.w_members_factor = ctrl.Consequent(universe_factors, 'w_members_factor')
+        self.w_energy_self_factor = ctrl.Consequent(universe_factors, 'w_energy_self_factor')
+        self.w_cost_ch_factor = ctrl.Consequent(universe_factors, 'w_cost_ch_factor')
+        self.w_rotation_factor = ctrl.Consequent(universe_factors, 'w_rotation_factor')
+        self.w_dis = ctrl.Consequent(universe_factors, 'w_dis')
+
+        for out_var in [self.w_members_factor, self.w_energy_self_factor, 
+                        self.w_cost_ch_factor, self.w_rotation_factor, self.w_dis]:
+            out_var['Decrease'] = fuzz.zmf(out_var.universe, 0.7, 0.9)
+            out_var['Neutral'] = fuzz.trimf(out_var.universe, [0.85, 1.0, 1.15])
+            out_var['Increase'] = fuzz.smf(out_var.universe, 1.1, 1.3)
+        logger.debug("Antecedents and consequents defined.")
+
+    def _define_rules_once(self):
+        logger.debug("Defining fuzzy rules for RewardWeightsFuzzySystem...")
+        rules = []
+        # 调整 w_members_factor
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_members_factor['Increase']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_members_factor['Neutral']))
+        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_members_factor['Decrease']))
+
+        # 调整 w_energy_self_factor
+        rules.append(ctrl.Rule(self.network_energy_level['Low'] & self.node_self_energy['High'], self.w_energy_self_factor['Increase']))
+        rules.append(ctrl.Rule(self.network_energy_level['Medium'] & self.node_self_energy['High'], self.w_energy_self_factor['Increase']))
+        rules.append(ctrl.Rule(self.network_energy_level['Low'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Increase']))
+        rules.append(ctrl.Rule(self.network_energy_level['High'] & self.node_self_energy['High'], self.w_energy_self_factor['Neutral']))
+        rules.append(ctrl.Rule(self.network_energy_level['Medium'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Neutral']))
+        rules.append(ctrl.Rule(self.network_energy_level['High'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Decrease']))
+        rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_energy_self_factor['Decrease']))
+        
+        # 调整 w_cost_ch_factor
+        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_cost_ch_factor['Increase']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_cost_ch_factor['Neutral']))
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_cost_ch_factor['Decrease']))
+        rules.append(ctrl.Rule(self.network_energy_level['Low'], self.w_cost_ch_factor['Decrease']))
+
+        # 调整 w_rotation_factor
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'] & (self.node_self_energy['High'] | self.node_self_energy['Medium']), self.w_rotation_factor['Increase']))
+        rules.append(ctrl.Rule((self.ch_density_global['Too_Low'] | self.ch_density_global['Optimal']) & self.node_self_energy['Low'], self.w_rotation_factor['Decrease']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'] & self.node_self_energy['High'], self.w_rotation_factor['Neutral']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'] & self.node_self_energy['Medium'], self.w_rotation_factor['Decrease']))
+        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_rotation_factor['Decrease']))
+
+        # 调整 w_dis (确保前提中的模糊集名称与定义一致)
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'] & (self.ch_density_global['Too_High'] | self.ch_density_global['Optimal']), self.w_dis['Increase']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'] & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Too_Low'], self.w_dis['Decrease']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Optimal'], self.w_dis['Neutral'])) # Corrected from ['Medium']
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Too_High'], self.w_dis['Increase']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['High'] & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['High'] & (self.ch_density_global['Too_High'] | self.ch_density_global['Optimal']), self.w_dis['Increase']))
+
+        if not rules:
+            logger.warning("RewardWeightsFuzzySystem: No specific rules were defined, adding a default neutral rule for all outputs.")
+            default_antecedent = self.network_energy_level['Medium'] # Pick one antecedent for default
+            for out_var in [self.w_members_factor, self.w_energy_self_factor, 
+                            self.w_cost_ch_factor, self.w_rotation_factor, self.w_dis]:
+                if hasattr(out_var, 'terms') and 'Neutral' in out_var.terms: # Check if 'Neutral' is defined
+                     rules.append(ctrl.Rule(default_antecedent, out_var['Neutral']))
+                else: # Fallback if 'Neutral' MF is not defined for some reason
+                     logger.error(f"Cannot add default rule for {out_var.label} as 'Neutral' MF is not defined.")
+        
+        logger.debug(f"Defined {len(rules)} rules for RewardWeightsFuzzySystem.")
+        return rules
+
+    def compute_reward_weights(self, current_net_energy_level, current_node_self_energy, 
+                               current_ch_density_global, current_ch_to_bs_dis_normalized):
+        
+        if self.control_system is None:
+            logger.error("RewardWeightsFuzzySystem: ControlSystem is not built. Cannot compute.")
+            # Return neutral weights if system isn't ready
+            return {'w_members_factor': 1.0, 'w_energy_self_factor': 1.0, 
+                    'w_cost_ch_factor': 1.0, 'w_rotation_factor': 1.0, 'w_dis': 1.0}
+
+        # Create a new simulation instance for each computation to ensure fresh state
+        simulation = ctrl.ControlSystemSimulation(self.control_system)
+        # logger.debug("Created new ControlSystemSimulation instance for compute_reward_weights.")
+
+        # --- 准备并裁剪输入值 ---
+        clipped_net_energy = np.clip(current_net_energy_level, self.network_energy_level.universe.min(), self.network_energy_level.universe.max())
+        clipped_self_energy = np.clip(current_node_self_energy, self.node_self_energy.universe.min(), self.node_self_energy.universe.max())
+        clipped_ch_density = np.clip(current_ch_density_global, self.ch_density_global.universe.min(), self.ch_density_global.universe.max())
+        clipped_ch_to_bs_dis = np.clip(current_ch_to_bs_dis_normalized, self.ch_to_bs_dis.universe.min(), self.ch_to_bs_dis.universe.max())
+
+        # --- 设置输入值 ---
+        simulation.input['network_energy_level'] = clipped_net_energy
+        simulation.input['node_self_energy'] = clipped_self_energy
+        simulation.input['ch_density_global'] = clipped_ch_density
+        simulation.input['ch_to_bs_dis'] = clipped_ch_to_bs_dis
+        
+        output_dict = {}
+        try:
+            # logger.debug(f"--- Fuzzy Inputs for compute_reward_weights (before compute) ---")
+            # logger.debug(f"  network_energy_level (clipped): {clipped_net_energy:.3f}")
+            # logger.debug(f"  node_self_energy (clipped): {clipped_self_energy:.3f}")
+            # logger.debug(f"  ch_density_global (clipped): {clipped_ch_density:.3f}")
+            # logger.debug(f"  ch_to_bs_dis (clipped): {clipped_ch_to_bs_dis:.3f}")
+
+            simulation.compute() 
+            
+            # logger.debug(f"--- Raw Simulation Output (all available keys after compute) ---")
+            # if hasattr(simulation, 'output') and isinstance(simulation.output, dict):
+            #     for key, value in simulation.output.items():
+            #         logger.debug(f"  Output '{key}': {value}")
+            # else:
+            #     logger.warning("  self.simulation.output is not a directly iterable dictionary after compute.")
+
+            output_vars_to_get = {
+                'w_members_factor': 1.0, 
+                'w_energy_self_factor': 1.0, 
+                'w_cost_ch_factor': 1.0, 
+                'w_rotation_factor': 1.0,
+                'w_dis': 1.0 
+            }
+            
+            for var_name, default_val in output_vars_to_get.items():
+                try:
+                    output_dict[var_name] = simulation.output[var_name]
+                except KeyError:
+                    logger.warning(f"输出变量 '{var_name}' 在 simulation.output 中未找到，使用默认值 {default_val}.")
+                    output_dict[var_name] = default_val
+                except TypeError: 
+                    logger.warning(f"simulation.output 不是字典类型，无法获取 '{var_name}'。使用默认值。")
+                    output_dict[var_name] = default_val
+            
+            return output_dict
+
+        except Exception as e: 
+            logger.error(f"错误：在 RewardWeightsFuzzySystem 计算或输出获取中: {e}", exc_info=True) # Add exc_info for full traceback
+            logger.error(f"  Input net_energy: {current_net_energy_level}, self_energy: {current_node_self_energy}, density: {current_ch_density_global}, bs_dist: {current_ch_to_bs_dis_normalized}")
+            return {'w_members_factor': 1.0, 'w_energy_self_factor': 1.0, 
+                    'w_cost_ch_factor': 1.0, 'w_rotation_factor': 1.0, 'w_dis': 1.0}
 # =============================================================================
 # Example Usage
 # =============================================================================

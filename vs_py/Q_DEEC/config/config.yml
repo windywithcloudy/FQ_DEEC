@@ -7,19 +7,21 @@ network:
   base_position: [250,250]  # 基站坐标
   seed: 42                  # 随机种子
   "communication_range": 100 # 从配置读取或默认
-  direct_bs_comm_threshold: 100 # 节点可直连BS的距离阈值 (m)
+  direct_bs_comm_threshold: 75 # 节点可直连BS的距离阈值 (m)
   poisson_disk_min_dist_factor: 0.65 # 用于计算最小距离的启发式因子 C (r = sqrt((area * C) / N))
                                      # 如果注释掉或未提供，env.py 中会使用默认值
   poisson_disk_k_samples: 30         # Bridson算法中每个激活点的候选采样次数
                                      # 如果注释掉或未提供，env.py 中会使用默认值
+  min_cluster_head_distance: 80    # 新增：最小簇头间距
+  edge_margin: 50                  # 新增：边缘边距
 
 # 能量模型参数
 energy:
   initial: 1             # 初始能量(J)
-  rx_cost: 50e-9            # 接收能耗(nJ/bit)
-  tx_amp_fs: 10e-12       # 自由空间模型的放大器能量 (epsilon_fs)
+  rx_cost: 5e-9           # 接收能耗(nJ/bit)
+  tx_amp_fs: 10e-12      # 自由空间模型的放大器能量 (epsilon_fs)
   tx_amp_mp: 0.0013e-12   # 多径衰落模型的放大器能量 (epsilon_mp)
-  data_rate: 250e3          # 数据传输速率(bps)
+  data_rate: 250000       # 数据传输速率(bps)
   threshold_d0: 87.7        # 距离阈值(自由空间/多径切换)
   idle_listening_per_round: 0.000001 # 假设的空闲监听消耗 (J/round)
   sensing_per_round: 0.0000005       # 假设的感知消耗 (J/round)
@@ -27,7 +29,7 @@ energy:
   
 # 仿真控制
 simulation:
-  total_rounds: 50        # 总仿真轮数
+  total_rounds: 50      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
 
@@ -41,23 +43,29 @@ visualization:
 
 fuzzy:
   fuzzy_opt:true
-  default_defuzzy_mothod:'centroid'
+  default_defuzzy_method:'centroid'
   default_AND:'min'
   default_OR:'max'
   fuzzy_logger_opt:'all'
+  #ch_compete_reward_weights:
+  #  p_opt_reference_for_density:0.1
 
   # ... 其他配置 ...
 
 # DEEC 协议参数
 deec:
-  p_opt: 0.1                # 期望的簇头百分比 (optimal percentage of CHs)
+  p_opt: 0.12                # 期望的簇头百分比 (optimal percentage of CHs)
   max_comm_range_increase_factor: 1.5 # 普通节点通信范围最大增加倍数
   min_ch_to_node_ratio_target: 0.05  # 目标最小CH/节点比例，低于此可能增加p_opt
   location_factor_enabled: true       # 是否启用位置因子
-  optimal_bs_dist_min: 70           # CH距离BS的最佳范围 - 最小值 (m)
+  optimal_bs_dist_min: 100           # CH距离BS的最佳范围 - 最小值 (m)
   optimal_bs_dist_max: 180          # CH距离BS的最佳范围 - 最大值 (m)
   penalty_factor_too_close: 0.6     # CH距离BS过近时的概率惩罚因子 (0-1)
-  penalty_factor_too_far: 0.85       # CH距离BS过远时的概率惩罚因子 (0-1)
+  penalty_factor_too_far: 0.5       # CH距离BS过远时的概率惩罚因子 (0-1)
+  min_inter_ch_distance_factor: 0.5
+  location_factor_enabled: true     # 启用位置因子
+  edge_penalty_factor: 0.3          # 边缘节点惩罚因子
+
   # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
   # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
                            # 对于初步集成，我们可以简化为每轮都可能重新选举
@@ -86,3 +94,23 @@ visualization:
     base_station: '#32CD32'
     dead_node: '#A9A9A9' # 如果需要区分死亡节点颜色
     direct_bs_node: '#FFD700' # 新增：直连BS节点的颜色 (例如金色)
+
+q_learning:
+  alpha_compete_ch: 0.1
+  gamma_compete_ch: 0.9
+  epsilon_compete_ch_initial: 0.6 # 初始探索率高一些
+  epsilon_compete_ch_decay: 0.995
+  epsilon_compete_ch_min: 0.01
+  # 可以为普通节点选择CH的Q学习也添加类似参数
+
+rewards:
+  ch_competition: # 竞争成为CH的基础奖励/惩罚值
+    member_join_unit: 2.0      # 每加入一个成员的基础奖励
+    self_energy_unit: 5.0      # 自身高能量成为CH的基础奖励因子
+    cost_of_being_ch: 5.0      # 成为CH的固定成本/惩罚
+    rotation_unit: 0.1         # 每轮未当CH的轮换奖励因子
+    missed_opportunity: 10.0   # 错失良机（本应成为CH但未成为）的惩罚
+    self_uncovered: 8.0        # 自己未被覆盖的惩罚
+    conserve_energy_low_self: 3.0 # 自身能量低时选择不当CH的奖励
+    passivity_ch_enough: 2.0   # 周围CH足够时选择不当CH的奖励
+    distance_impact_unit: 5.0 # w_dis 影响的基础奖励/惩罚幅度
