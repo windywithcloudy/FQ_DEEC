@@ -163,6 +163,10 @@ class WSNEnv:
         self.optimal_bs_dist_max = deec_cfg.get('optimal_bs_dist_max', 200)
         self.penalty_factor_too_close = deec_cfg.get('penalty_factor_too_close', 0.5)
         self.penalty_factor_too_far = deec_cfg.get('penalty_factor_too_far', 0.5)
+        self.epoch_length = int(deec_cfg.get('epoch_length', 20)) # 读取Epoch长度
+        if self.epoch_length <= 0:
+            logger.warning("Epoch length_must be positive. Setting to default 20.")
+            self.epoch_length = 20
 
         # Q-learning parameters from config (or defaults)
         q_learning_cfg = self.config.get('q_learning', {})
@@ -172,7 +176,12 @@ class WSNEnv:
         self.epsilon_compete_decay = float(q_learning_cfg.get('epsilon_compete_ch_decay', 0.995))
         self.epsilon_compete_min = float(q_learning_cfg.get('epsilon_compete_ch_min', 0.01))
         self.current_epsilon_compete = self.epsilon_compete_initial
-        self.reward_weights_adjuster = RewardWeightsFuzzySystemForCHCompetition(self.config)
+        if not hasattr(self, 'reward_weights_adjuster'):
+            from utils.fuzzy import RewardWeightsFuzzySystemForCHCompetition
+            self.reward_weights_adjuster = RewardWeightsFuzzySystemForCHCompetition(self.config)
+        if not hasattr(self, 'normal_node_fuzzy_logic'):
+            from utils.fuzzy import NormalNodeCHSelectionFuzzySystem # 确保导入路径正确
+            self.normal_node_fuzzy_logic = NormalNodeCHSelectionFuzzySystem(self.config)
 
         # E_total_initial 用于DEEC计算，每个节点的初始能量可能不同，DEEC原版假设相同
         # 我们这里假设所有节点的初始能量相同，取第一个节点的初始能量作为参考
@@ -181,6 +190,7 @@ class WSNEnv:
         self._init_nodes()
         self.confirmed_cluster_heads_previous_round = []
         self.confirmed_cluster_heads_current_round = []
+        self.confirmed_cluster_heads_for_epoch = []
         logger.info(f"WSN 环境初始化完成，共 {len(self.nodes)} 个节点。")
 
     def   _init_nodes(self):
@@ -402,7 +412,8 @@ class WSNEnv:
 
     def calculate_reward_for_ch_competition(self, node_id, action_taken, 
                                             actual_members_joined=0, 
-                                            is_uncovered_after_all_selections=False):
+                                            is_uncovered_after_all_selections=False
+                                            ):
         """计算节点竞争CH后的奖励，使用模糊逻辑调整的权重。"""
         node = self.nodes[node_id]
         raw_state = self.get_node_state_for_ch_competition(node_id) # 获取原始状态值
@@ -556,7 +567,7 @@ class WSNEnv:
         # threshold_medium_outer = comm_range_avg * medium_density_outer_factor # 这个是中等密度环带的外边界
 
         max_chs_in_medium_ring = self.config.get('deec', {}).get('ch_finalize_max_in_medium_ring', 3)
-        min_total_chs_after_filter = max(1, int(target_ch_count_ideal * 0.7)) # 筛选后至少保留的CH数量
+        min_total_chs_after_filter = max(1, int(target_ch_count_ideal * 0.8)) # 筛选后至少保留的CH数量
 
         logger.debug(f"CH最终确定参数：理想CH数={target_ch_count_ideal}, 过近阈值={threshold_too_close:.1f}m, "
                      f"中等环带最大CH数={max_chs_in_medium_ring}, 筛选后最小总CH数={min_total_chs_after_filter}")
@@ -566,7 +577,7 @@ class WSNEnv:
         ch_declarations_this_round.sort(key=lambda id_val: self.nodes[id_val]["energy"], reverse=True)
         
         # 初步候选列表，数量可以比理想值略多，给后续空间筛选留余地
-        preliminary_candidates = ch_declarations_this_round[:max(min_total_chs_after_filter, int(target_ch_count_ideal * 1.5))]
+        preliminary_candidates = ch_declarations_this_round[:max(min_total_chs_after_filter, int(target_ch_count_ideal * 1.8))]
         logger.debug(f"初步能量筛选后，候选CH数量: {len(preliminary_candidates)}")
 
         if not preliminary_candidates:
@@ -644,21 +655,107 @@ class WSNEnv:
         
         logger.info(f"最终确认本轮活跃CH ({len(self.confirmed_cluster_heads_current_round)}个): {self.confirmed_cluster_heads_current_round}")
 
+    def get_q_value_select_ch(self, node_id, ch_id):
+        node = self.nodes[node_id]
+        return node["q_table_select_ch"].get(ch_id, 0.0) # 默认为0
+
+    def update_q_value_select_ch(self, node_id, ch_id, reward): # 简化为单步优化
+        node = self.nodes[node_id]
+        q_table = node["q_table_select_ch"]
+        alpha = node.get("alpha_select_ch", 0.1) # 从节点获取或用默认
+        
+        old_q_value = q_table.get(ch_id, 0.0)
+        # Simplified Q-update (like multi-armed bandit, or Q-learning with gamma=0 or next_max_q=0)
+        new_q_value = old_q_value + alpha * (reward - old_q_value)
+        q_table[ch_id] = new_q_value
+        # logger.debug(f"Node {node_id} Q_select_CH update: CH={ch_id}, R={reward:.2f}, OldQ={old_q_value:.3f}, NewQ={new_q_value:.3f}")
+
+
+    def calculate_reward_for_selecting_ch(self, normal_node_id, chosen_ch_id, 
+                                          fuzzy_weights, 
+                                          transmission_successful=True, 
+                                          actual_energy_spent_tx=0):
+        # --- 获取基础奖励/惩罚单位值 (从config) ---
+        reward_cfg = self.config.get('rewards', {}).get('select_ch', {})
+        R_success_val = float(reward_cfg.get('transmission_success', 50))
+        R_fail_val = float(reward_cfg.get('transmission_fail', -50))
+        
+        energy_factor_scale = float(reward_cfg.get('energy_component_scale', 20)) # 用于缩放能量项贡献
+        path_factor_scale = float(reward_cfg.get('path_component_scale', 30))     # 用于缩放路径项贡献
+        load_factor_scale = float(reward_cfg.get('load_component_scale', 20))     # 用于缩放负载项贡献
+        dist_bs_factor_scale = float(reward_cfg.get('dist_bs_component_scale', 10))# 用于缩放距离项贡献
+
+        # --- 1. 结果奖励 ---
+        reward = R_success_val if transmission_successful else R_fail_val
+
+        node_n = self.nodes[normal_node_id]
+        node_ch = self.nodes[chosen_ch_id]
+
+        # --- 2. CH能量相关奖励 (越高越好) ---
+        # e_cluster_normalized 是 CH 的归一化能量 [0,1]
+        # 我们希望能量高时奖励为正，能量低时为负（相对于一个中点0.5）
+        ch_energy_metric = (node_ch["energy"] / node_ch["initial_energy"] if node_ch["initial_energy"] > 0 else 0) - 0.5
+        reward += fuzzy_weights['w_e_ch'] * ch_energy_metric * energy_factor_scale
+
+        # --- 3. 路径相关奖励 (能耗低、成功率高越好) ---
+        # actual_energy_spent_tx (需要归一化或与一个参考值比较)
+        # 假设 avg_e_send_to_ch 是一个参考平均能耗
+        # avg_e_send_to_ch_ref = self.config.get('energy',{}).get('avg_send_to_ch_ref', 0.001) # 从config获取参考值
+        # path_cost_metric = -(actual_energy_spent_tx / avg_e_send_to_ch_ref) if avg_e_send_to_ch_ref > 0 else -10 # 示例，能耗越低越好
+        # 简化：直接用能耗惩罚，能耗越低惩罚越小
+        path_cost_metric = -actual_energy_spent_tx * 1000 # 放大一点，假设能耗是小数
+        
+        # r_success_with_ch (需要获取或估计普通节点与该CH的历史成功率)
+        # 暂时假设 r_success_with_ch = 1.0 (理想) 或从节点属性获取
+        r_success_metric = node_n.get("history_success_with_ch", {}).get(chosen_ch_id, 0.8) # 示例：默认0.8
+        path_metric = path_cost_metric + r_success_metric * 10 # 示例组合
+
+        reward += fuzzy_weights['w_path'] * path_metric * path_factor_scale # 注意：path_factor_scale 可能需要调整
+
+        # --- 4. CH负载相关奖励 (负载低越好) ---
+        # p_cluster_ratio_j 是 CH 的负载比率 (actual_load / avg_load)
+        # avg_load_ref = node_n.get("avg_load_per_ch_for_fuzzy", 10) # 这个应该从 NormalNodeCHSelectionFuzzySystem 的实例获取或传入
+        # 假设我们能直接获取到CH的成员数
+        ch_member_count = len([m_node for m_node in self.nodes if m_node.get("cluster_id") == chosen_ch_id and m_node["status"]=='active'])
+        # 负载惩罚：成员越多，惩罚越大 (相对于一个理想值)
+        ideal_members_per_ch = self.config.get('deec',{}).get('ideal_members_per_ch_ref', 
+                                  max(1, self.get_alive_nodes() / (len(self.confirmed_cluster_heads_current_round) if self.confirmed_cluster_heads_current_round else 1) )
+                                 ) 
+        load_metric = -(ch_member_count - ideal_members_per_ch) # 成员数超过理想值则为负
+        reward += fuzzy_weights['w_load'] * load_metric * load_factor_scale
+        
+        # --- 5. CH到BS距离相关奖励 (距离近越好) ---
+        # d_c_base_normalized_j 是 CH 到BS的归一化距离 [0,1]
+        d_c_base_j = self.calculate_distance_to_bs(chosen_ch_id)
+        d_c_base_normalized_j = d_c_base_j / self.network_diagonal if self.network_diagonal > 0 else 0
+        dist_bs_metric = (0.5 - d_c_base_normalized_j) # 越近值越大 (0.5是中点)
+        reward += fuzzy_weights['w_dist_bs'] * dist_bs_metric * dist_bs_factor_scale
+        
+        # logger.debug(f"Node {normal_node_id} reward for CH {chosen_ch_id}: R_total={reward:.2f} [Outcome_R={reward - (fuzzy_weights['w_e_ch'] * ...)}, FuzzyWeightedTerms=...]")
+        return reward
+
+
     def step(self, current_round_num):
         self.current_round = current_round_num
-        logger.info(f"--- 开始第 {self.current_round} 轮 (Epsilon Compete: {self.current_epsilon_compete:.3f}) ---")
+        logger.info(f"--- 开始第 {self.current_round} 轮  ---")
 
         # 0. 更新和准备工作
-        self.confirmed_cluster_heads_previous_round = list(self.confirmed_cluster_heads_current_round) # 保存上一轮的CH
         self.confirmed_cluster_heads_current_round = []
         self.identify_direct_bs_nodes()
         for node in self.nodes:
             if node["status"] == "active":
                  node["current_communication_range"] = node["base_communication_range"]
-                 # 更新每个节点的epsilon (如果它们有独立的epsilon)
-                 # node["epsilon_compete"] = max(self.epsilon_compete_min, node["epsilon_compete"] * self.epsilon_compete_decay)
-        # 或者全局更新 epsilon
-        self.current_epsilon_compete = max(self.epsilon_compete_min, self.current_epsilon_compete * self.epsilon_compete_decay)
+                 if node["role"] == "normal" and not node.get("can_connect_bs_directly", False):
+                    min_eps_select = self.config.get('q_learning',{}).get('epsilon_select_ch_min',0.01)
+                    decay_select = self.config.get('q_learning',{}).get('epsilon_select_ch_decay',0.995)
+                    current_eps_select = node.get("epsilon_select_ch", self.config.get('q_learning',{}).get('epsilon_select_ch_initial',0.3))
+                    node["epsilon_select_ch"] = max(min_eps_select, current_eps_select * decay_select)
+        if not hasattr(self, 'normal_node_fuzzy_logic'):
+            from utils.fuzzy import NormalNodeCHSelectionFuzzySystem # 确保导入
+            # NormalNodeCHSelectionFuzzySystem 的 __init__ 可能需要 node_sum, cluster_sum
+            # 这些是动态的，所以要么每次都创建新的，要么让它能更新这些内部状态
+            # 简单起见，我们假设它在 __init__ 中只需要主 config
+            self.normal_node_fuzzy_logic = NormalNodeCHSelectionFuzzySystem(self.config)
 
 
         # --- 实例化或更新模糊逻辑系统 ---
@@ -673,76 +770,229 @@ class WSNEnv:
         # ^^^ 这些应该在循环内，基于每个节点的视角或全局状态
 
 
-        # === 阶段1: 节点通过Q学习竞争成为CH ===
-        logger.info("开始阶段1：节点竞争成为CH...")
-        ch_declarations_this_round = []
-        competition_log = {} # node_id -> {"state_tuple": S, "action": A, "raw_state": raw_S}
-
-        nodes_eligible_for_competition = [
-            n for n in self.nodes
-            if n["status"] == "active" and not n.get("can_connect_bs_directly", False)
-        ]
-
-        for node_data in nodes_eligible_for_competition:
-            node_id = node_data["id"]
-            state_tuple = self.get_discrete_state_tuple_for_competition(node_id)
-            if state_tuple is None: continue
-
-            action_to_take = 0
-            if random.random() < self.current_epsilon_compete: # 使用全局衰减的epsilon
-                action_to_take = random.choice([0, 1])
-            else:
-                q0 = self.get_q_value_compete_ch(node_id, state_tuple, 0)
-                q1 = self.get_q_value_compete_ch(node_id, state_tuple, 1)
-                action_to_take = 1 if q1 > q0 else (0 if q0 > q1 else random.choice([0,1])) # 如果相等则随机
+        # === Epoch 开始时的特殊处理 ===
+        if self.current_round % self.epoch_length == 0:
+            logger.info(f"--- ***** 新 Epoch 开始 (轮次 {self.current_round}) ***** ---")
+            # 保存上一epoch的CH（如果需要用于CH竞争状态）
+            self.confirmed_cluster_heads_previous_round = list(self.confirmed_cluster_heads_for_epoch)
             
-            competition_log[node_id] = {"state_tuple": state_tuple, "action": action_to_take, 
-                                        "raw_state": self.get_node_state_for_ch_competition(node_id)} # 保存原始状态用于奖励
-            if action_to_take == 1:
-                ch_declarations_this_round.append(node_id)
-        
-        logger.info(f"CH竞争阶段：{len(ch_declarations_this_round)} 个节点宣告想成为CH: {ch_declarations_this_round}")
+            # CH竞争Q学习的epsilon可以在epoch开始时衰减
+            self.current_epsilon_compete = max(
+                self.epsilon_compete_min, 
+                self.current_epsilon_compete * (self.epsilon_compete_decay ** self.epoch_length) # 或者一个固定的epoch衰减
+            ) 
+            logger.info(f"Epoch开始，CH竞争Epsilon更新为: {self.current_epsilon_compete:.4f}")
 
-        # === 阶段1.5: 从宣告者中最终确定本轮CH ===
-        self.finalize_ch_roles(ch_declarations_this_round)
+            # --- 阶段1: 节点通过Q学习决定是否宣告成为CH (仅在Epoch开始时) ---
+            logger.info("Epoch开始：节点通过Q学习竞争成为CH...")
+            ch_declarations_this_epoch = [] 
+            competition_log_this_epoch = {} 
+
+            nodes_eligible_for_competition = [
+                n for n in self.nodes
+                if n["status"] == "active" and not n.get("can_connect_bs_directly", False)
+            ]
+
+            for node_data in nodes_eligible_for_competition:
+                node_id = node_data["id"]
+                state_tuple_compete = self.get_discrete_state_tuple_for_competition(node_id) # 使用上一epoch的CH信息
+                if state_tuple_compete is None: continue
+
+                action_to_take = 0 
+                current_node_epsilon_compete = node_data.get("epsilon_compete", self.current_epsilon_compete)
+                if random.random() < self.current_epsilon_compete: # 使用全局衰减的CH竞争epsilon
+                    action_to_take = random.choice([0, 1])
+                else:
+                    q0 = self.get_q_value_compete_ch(node_id, state_tuple_compete, 0)
+                    q1 = self.get_q_value_compete_ch(node_id, state_tuple_compete, 1)
+                    action_to_take = 1 if q1 > q0 else (0 if q0 > q1 else random.choice([0,1]))
+                
+                competition_log_this_epoch[node_id] = { # 记录本epoch的CH竞争决策
+                    "state_tuple": state_tuple_compete, 
+                    "action": action_to_take, 
+                    "raw_state": self.get_node_state_for_ch_competition(node_id) 
+                }
+                if action_to_take == 1:
+                    ch_declarations_this_epoch.append(node_id)
+            
+            logger.info(f"Epoch CH竞争：{len(ch_declarations_this_epoch)} 个节点宣告想成为CH: {ch_declarations_this_epoch}")
+
+            # --- 阶段1.5: 从宣告者中最终确定本Epoch的活跃CH ---
+            # finalize_ch_roles 会填充 self.confirmed_cluster_heads_for_epoch 并更新节点角色和time_since_last_ch
+            self.finalize_ch_roles(ch_declarations_this_epoch) 
+            
+            # --- 为本Epoch的CH竞争决策计算奖励并更新Q表 ---
+            # 这个奖励是基于整个Epoch的表现，还是基于宣告时的预期？
+            # 简单起见，我们可以在Epoch结束时，或者在CH角色确定后，根据一些即时指标（如CH是否真的被选上，位置是否好）更新。
+            # 更准确的是在Epoch结束时，根据CH的实际表现（服务了多少节点，数据传输成功率等）来更新。
+            # 为了简化，我们先在CH角色确定后，根据一些简单指标（如是否被选上，位置）给一个即时奖励。
+            # actual_members_joined 在这个时间点还不知道，因为普通节点还没选。
+            logger.info("Epoch开始：更新CH竞争Q表 (基于宣告和最终确认)...")
+            for node_id, log_info in competition_log_this_epoch.items(): # 使用正确的变量名
+                node = self.nodes[node_id]
+                if node["status"] == "dead": 
+                    reward_compete = self.calculate_reward_for_ch_competition(
+                        node_id, log_info["action"], 0, True
+                    )
+                    self.update_q_value_compete_ch(node_id, log_info["state_tuple"], log_info["action"], reward_compete, None)
+                    continue
+
+                actual_members = 0
+                if node["role"] == "cluster_head":
+                    actual_members = len([m_node for m_node in self.nodes if m_node.get("cluster_id") == node_id and m_node["status"]=='active'])
+                is_uncovered = (node["role"] == "normal" and node["cluster_id"] == -1 and not node.get("can_connect_bs_directly", False))
+                
+                # ... (获取模糊权重 current_fuzzy_reward_weights) ...
+                # (确保 self.reward_weights_adjuster 已实例化)
+                if not hasattr(self, 'reward_weights_adjuster'):
+                    from utils.fuzzy import RewardWeightsFuzzySystemForCHCompetition
+                    self.reward_weights_adjuster = RewardWeightsFuzzySystemForCHCompetition(self.config)
+                # ... (计算模糊输入) ...
+                net_energy_level_norm = self._calculate_current_average_energy() / self.E0 if self.E0 > 0 else 0
+                node_self_energy_norm = node["energy"] / node["initial_energy"] if node["initial_energy"] > 0 else 0
+                current_ch_density_global_val = len(self.confirmed_cluster_heads_for_epoch) / self.get_alive_nodes() if self.get_alive_nodes() > 0 else 0 # 使用 for_epoch
+                current_ch_to_bs_dis_norm = (self.calculate_distance_to_bs(node_id) / self.network_diagonal) if self.network_diagonal > 0 else 0
+
+                current_fuzzy_reward_weights = self.reward_weights_adjuster.compute_reward_weights(
+                    net_energy_level_norm, node_self_energy_norm, 
+                    current_ch_density_global_val, current_ch_to_bs_dis_norm
+                )
+
+
+                reward_compete = self.calculate_reward_for_ch_competition(
+                    node_id, log_info["action"], actual_members, is_uncovered, 
+                    # fuzzy_reward_weights=current_fuzzy_reward_weights # 如果你的函数签名需要它
+                ) # 注意：我之前的 calculate_reward_for_ch_competition 已经改为内部计算模糊权重
+
+                # ... (获取 next_state_tuple_for_update) ...
+                # ... (如之前讨论的简化或更复杂的 S' 估计) ...
+                next_state_tuple_for_update = None # 临时简化
+
+                self.update_q_value_compete_ch(node_id, log_info["state_tuple"], log_info["action"], reward_compete, next_state_tuple_for_update)
 
         # === 阶段2: 普通节点使用Q学习选择已确定的CH ===
         logger.info("开始阶段2：普通节点Q学习选择簇头...")
-        # TODO: 在这里集成你的 NormalNodeCHSelectionFuzzySystem 和普通节点的Q学习选择逻辑
-        # 普通节点会从 self.confirmed_cluster_heads_current_round 中选择
-        # 你需要记录普通节点选择CH的决策，用于后续更新其 q_table_select_ch
-        # 暂时使用之前的随机占位符，但要确保它从 confirmed_cluster_heads_current_round 中选
-        num_nodes_assigned_by_q_learning_placeholder = 0
-        # ... (之前的随机选择占位符逻辑，确保它从 self.confirmed_cluster_heads_current_round 中选) ...
-        # ... 并且更新 node_data["cluster_id"] ...
-        # ... (这个占位符需要你自己用完整的Q学习逻辑替换) ...
-        # 创建 NormalNodeCHSelectionFuzzySystem 实例
-        # 注意：node_sum 和 cluster_sum 应该是当前轮次的实际值
-        # current_active_nodes = self.get_alive_nodes()
-        # current_confirmed_chs_count = len(self.confirmed_cluster_heads_current_round)
-        # normal_node_fuzzy_logic = NormalNodeCHSelectionFuzzySystem(node_sum=current_active_nodes, 
-        #                                                          cluster_sum=max(1, current_confirmed_chs_count)) #避免除零
+        num_nodes_assigned_this_round = 0
         
-        # 示例：如果用随机选择，并标记哪些普通节点做了选择
+        # 获取用于模糊逻辑的平均负载参考 (只计算一次，如果CH列表不变)
+        # 或者，如果 NormalNodeCHSelectionFuzzySystem 内部不处理这个，就在这里计算
+        avg_load_per_confirmed_ch_ref = self.get_alive_nodes() / len(self.confirmed_cluster_heads_current_round) \
+                                        if self.confirmed_cluster_heads_current_round else 10 # 默认10个成员/CH
+
+        # 硬编码 avg_e_send_total_for_normal_node_ref (方案A)
+        AVG_E_SEND_REF_NORMAL_NODE = 0.001 # 你可以调整这个值，或者从一个不常用的config位置读取
+        logger.debug(f"Using hardcoded AVG_E_SEND_REF_NORMAL_NODE: {AVG_E_SEND_REF_NORMAL_NODE}")
+
+
         for node_data in self.nodes:
-            if node_data["status"] == "active" and node_data["role"] == "normal" and \
+            if node_data["status"] == "active" and \
+               node_data["role"] == "normal" and \
                not node_data.get("can_connect_bs_directly", False) and \
-               node_data["cluster_id"] == -1: # 确保只为未分配的普通节点选择
-                
-                eligible_chs_for_node = []
+               node_data["cluster_id"] == -1: 
+
+                node_id = node_data["id"]
+                reachable_chs = [] # 存储 (ch_id, distance_to_ch)
                 if self.confirmed_cluster_heads_current_round:
-                    for ch_id in self.confirmed_cluster_heads_current_round:
-                        if self.nodes[ch_id]["status"] == "active":
-                            distance = self.calculate_distance(node_data["id"], ch_id)
+                    for ch_id_cand in self.confirmed_cluster_heads_current_round: # 使用 confirmed CHs
+                        if self.nodes[ch_id_cand]["status"] == "active":
+                            distance = self.calculate_distance(node_id, ch_id_cand)
                             if distance <= node_data["current_communication_range"] and \
-                               distance <= self.nodes[ch_id]["current_communication_range"]:
-                                eligible_chs_for_node.append(ch_id)
+                               distance <= self.nodes[ch_id_cand]["current_communication_range"]:
+                                reachable_chs.append((ch_id_cand, distance))
                 
-                if eligible_chs_for_node:
-                    # TODO: Replace random choice with Q-learning decision using NormalNodeCHSelectionFuzzySystem
-                    chosen_ch_id = random.choice(eligible_chs_for_node) 
+                if not reachable_chs:
+                    continue
+
+                chosen_ch_id = -1
+                # epsilon_select_ch 应该在 node_data 中维护和衰减
+                current_epsilon_select = node_data.get("epsilon_select_ch", 
+                                         self.config.get('q_learning',{}).get('epsilon_select_ch_initial',0.3))
+
+                if random.random() < current_epsilon_select: 
+                    chosen_ch_id = random.choice([ch_info[0] for ch_info in reachable_chs])
+                else: 
+                    best_q_val = -float('inf')
+                    candidate_for_best_q = -1
+                    for ch_id_cand, _ in reachable_chs: # distance暂时不用在Q值比较中
+                        q_val = self.get_q_value_select_ch(node_id, ch_id_cand)
+                        if q_val > best_q_val:
+                            best_q_val = q_val
+                            candidate_for_best_q = ch_id_cand
+                        elif q_val == best_q_val and candidate_for_best_q != -1: # 处理Q值相同的情况
+                            if random.random() < 0.5 : candidate_for_best_q = ch_id_cand
+                        elif candidate_for_best_q == -1: # 如果所有都是-inf或0，这是第一个
+                            candidate_for_best_q = ch_id_cand
+
+                    chosen_ch_id = candidate_for_best_q if candidate_for_best_q != -1 else random.choice([ch_info[0] for ch_info in reachable_chs])
+                
+                if chosen_ch_id != -1:
                     node_data["cluster_id"] = chosen_ch_id
-                    num_nodes_assigned_by_q_learning_placeholder +=1
+                    num_nodes_assigned_this_round += 1
+                    
+                    ch_node_chosen = self.nodes[chosen_ch_id]
+                    dc_base_chosen_ch = self.calculate_distance_to_bs(chosen_ch_id)
+                    e_cluster_chosen_ch_norm = ch_node_chosen["energy"] / ch_node_chosen["initial_energy"] if ch_node_chosen["initial_energy"] > 0 else 0
+                    
+                    # 负载比率：CH当前成员数 / 平均每个CH应服务成员数
+                    # 注意：这里的成员数应该是CH被当前node_id选择 *之前* 的。
+                    # 为了简化，我们用它当前的成员数（可能包含了本轮其他已选它的节点）
+                    # 或者，更简单的是，在普通节点选择CH时，假设CH的初始负载为0或很小，
+                    # 因为这是CH刚被选出来，还没有成员。
+                    # 我们用一个简化的“负载潜力”概念，或者直接用一个较小的值。
+                    # 实际负载会在所有普通节点选择完毕后才能准确统计。
+                    # 为了让模糊逻辑的 p_cluster_ratio 有意义，我们需要一个对CH负载的估计。
+                    # 方案：先让所有普通节点“意向选择”，然后统计每个CH的意向成员数作为负载。
+                    # 简化：暂时使用一个固定的低负载比率或基于CH自身属性的估计。
+                    # 这里，我们用一个简单的负载比率，假设avg_load_per_confirmed_ch_ref是理想的每个CH的成员数
+                    # 而ch_node_chosen当前的成员数是 load_actual_chosen_ch
+                    # 实际负载可能是动态变化的，这里用一个估计值
+                    load_actual_chosen_ch = len([m for m in self.nodes if m.get("cluster_id") == chosen_ch_id and m.get("status") == 'active']) 
+                    p_cluster_ratio_for_fuzzy = load_actual_chosen_ch / avg_load_per_confirmed_ch_ref if avg_load_per_confirmed_ch_ref > 0 else 0
+                    
+                    r_success_with_chosen_ch_norm = node_data.get("history_success_with_ch", {}).get(chosen_ch_id, 0.9) 
+                    
+                    dist_to_chosen_ch = self.calculate_distance(node_id, chosen_ch_id) # 重新获取，因为reachable_chs中存了
+                    packet_size = self.config.get("simulation",{}).get("packet_size",4000)
+                    actual_e_send_to_chosen_ch = self.calculate_transmission_energy(dist_to_chosen_ch, packet_size, is_tx_operation=True)
+                    
+                    e_send_total_ratio_for_fuzzy = actual_e_send_to_chosen_ch / AVG_E_SEND_REF_NORMAL_NODE if AVG_E_SEND_REF_NORMAL_NODE > 0 else 0
+                    
+                    fuzzy_weights_for_chosen_ch = self.normal_node_fuzzy_logic.compute_weights(
+                        current_dc_base=dc_base_chosen_ch,
+                        current_e_cluster_normalized=e_cluster_chosen_ch_norm,
+                        current_p_cluster_ratio_val=p_cluster_ratio_for_fuzzy, 
+                        current_r_success_normalized=r_success_with_chosen_ch_norm,
+                        current_e_send_total_ratio_val=e_send_total_ratio_for_fuzzy 
+                    )
+
+                    # 模拟传输并获取奖励
+                    transmission_success = True if random.random() < r_success_with_chosen_ch_norm * 0.98 else False # 略微降低一点实际成功率
+
+                    reward_for_selection = self.calculate_reward_for_selecting_ch(
+                        node_id, chosen_ch_id, fuzzy_weights_for_chosen_ch,
+                        transmission_successful=transmission_success,
+                        actual_energy_spent_tx=actual_e_send_to_chosen_ch
+                    )
+                    
+                    self.update_q_value_select_ch(node_id, chosen_ch_id, reward_for_selection)
+
+                    # --- 实际能量消耗 ---
+                    # 普通节点发送
+                    if transmission_success : # 只有成功才认为CH收到了
+                        if self.consume_node_energy(node_id, actual_e_send_to_chosen_ch):
+                            node_data["tx_count"] += 1
+                        # CH接收
+                        energy_rx_ch = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+                        if self.consume_node_energy(chosen_ch_id, energy_rx_ch):
+                            self.nodes[chosen_ch_id]["rx_count"] +=1
+            
+                # 更新节点的epsilon_select_ch
+                min_eps_select = self.config.get('q_learning',{}).get('epsilon_select_ch_min',0.01)
+                decay_select = self.config.get('q_learning',{}).get('epsilon_select_ch_decay',0.995)
+                current_epsilon_select = max(min_eps_select, current_epsilon_select * decay_select)
+                node_data["epsilon_select_ch"] = current_epsilon_select # 保存更新后的epsilon
+
+        logger.info(f"Q学习选择CH阶段：{num_nodes_assigned_this_round} 个普通节点完成了选择。")
 
 
         # === 阶段2之后: 处理仍然孤立的普通节点 ===
@@ -756,13 +1006,13 @@ class WSNEnv:
         # reward_weights_adjuster = RewardWeightsFuzzySystemForCHCompetition(self.config) # 确保config传递正确
         # 或者在 __init__ 中创建 self.reward_weights_adjuster
 
-        for node_id, log_info in competition_log.items():
+        for node_id, log_info in competition_log_this_epoch.items():
             node = self.nodes[node_id]
             if node["status"] == "dead" and node["energy"] > 0: # 节点可能在本轮的其他操作中死亡
                  logger.warning(f"Node {node_id} status is dead but energy > 0. Forcing energy to 0.")
                  node["energy"] = 0 # 确保死亡节点能量为0
             if node["status"] == "dead": # 如果节点在本轮后续操作中死亡，S'的maxQ为0
-                reward = self.calculate_reward_for_ch_competition(node_id, log_info["action"], 0, True, None,0) # 假设死亡=未覆盖
+                reward = self.calculate_reward_for_ch_competition(node_id, log_info["action"], 0, True, None) # 假设死亡=未覆盖
                 self.update_q_value_compete_ch(node_id, log_info["state_tuple"], log_info["action"], reward, None) # None for next_state
                 continue
 
@@ -822,7 +1072,23 @@ class WSNEnv:
         # TODO: 更新普通节点选择CH的Q表
 
         # === 调整下一轮的p_opt (如果仍然需要DEEC的p_opt作为某种参考或目标CH比例) ===
-        # self.adjust_p_opt_for_next_round(...) 
+        if (self.current_round + 1) % self.epoch_length == 0 or \
+           self.current_round == self.config.get('simulation',{}).get('total_rounds',10)-1:
+            
+            # 统计本epoch最终的孤立节点情况
+            isolated_normal_nodes_at_epoch_end = 0
+            for node_data_val in self.nodes:
+                if node_data_val["status"] == "active" and \
+                   node_data_val["role"] == "normal" and \
+                   node_data_val["cluster_id"] == -1 and \
+                   not node_data_val.get("can_connect_bs_directly", False):
+                    isolated_normal_nodes_at_epoch_end += 1
+            
+            logger.info(f"Epoch {self.current_round // self.epoch_length} 结束: "
+                        f"孤立普通节点数 = {isolated_normal_nodes_at_epoch_end}, "
+                        f"CH数 = {len(self.confirmed_cluster_heads_for_epoch)}")
+            
+            self.adjust_p_opt_for_next_round(isolated_normal_nodes_at_epoch_end)
 
         # === 模拟本轮的能量消耗 ===
         # 注意：这里的能耗应该是与Q学习决策和数据传输分离的背景能耗

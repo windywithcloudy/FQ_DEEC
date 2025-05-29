@@ -6,7 +6,7 @@ network:
   area_size: [500, 500]     # 网络区域尺寸(米)
   base_position: [250,250]  # 基站坐标
   seed: 42                  # 随机种子
-  "communication_range": 100 # 从配置读取或默认
+  "communication_range": 130 # 从配置读取或默认
   direct_bs_comm_threshold: 75 # 节点可直连BS的距离阈值 (m)
   poisson_disk_min_dist_factor: 0.65 # 用于计算最小距离的启发式因子 C (r = sqrt((area * C) / N))
                                      # 如果注释掉或未提供，env.py 中会使用默认值
@@ -47,14 +47,12 @@ fuzzy:
   default_AND:'min'
   default_OR:'max'
   fuzzy_logger_opt:'all'
-  #ch_compete_reward_weights:
-  #  p_opt_reference_for_density:0.1
 
   # ... 其他配置 ...
 
 # DEEC 协议参数
 deec:
-  p_opt: 0.12                # 期望的簇头百分比 (optimal percentage of CHs)
+  p_opt: 0.135                # 期望的簇头百分比 (optimal percentage of CHs)
   max_comm_range_increase_factor: 1.5 # 普通节点通信范围最大增加倍数
   min_ch_to_node_ratio_target: 0.05  # 目标最小CH/节点比例，低于此可能增加p_opt
   location_factor_enabled: true       # 是否启用位置因子
@@ -65,7 +63,7 @@ deec:
   min_inter_ch_distance_factor: 0.5
   location_factor_enabled: true     # 启用位置因子
   edge_penalty_factor: 0.3          # 边缘节点惩罚因子
-
+  epoch_length: 20
   # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
   # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
                            # 对于初步集成，我们可以简化为每轮都可能重新选举
@@ -114,3 +112,12 @@ rewards:
     conserve_energy_low_self: 3.0 # 自身能量低时选择不当CH的奖励
     passivity_ch_enough: 2.0   # 周围CH足够时选择不当CH的奖励
     distance_impact_unit: 5.0 # w_dis 影响的基础奖励/惩罚幅度
+    select_ch: # 普通节点选择CH的奖励组件基础值
+    transmission_success: 50.0
+    transmission_fail: -50.0
+    energy_component_scale: 20.0  # 用于缩放CH能量项的贡献
+    path_component_scale: 30.0    # 用于缩放路径成本/成功率项的贡献
+    load_component_scale: 20.0    # 用于缩放CH负载项的贡献
+    dist_bs_component_scale: 10.0 # 用于缩放CH到BS距离项的贡献
+    # ideal_members_per_ch_ref: 5 # 理想的每个CH服务的成员数参考值 (用于负载奖励) 
+                                  # 这个也可以在代码中动态计算

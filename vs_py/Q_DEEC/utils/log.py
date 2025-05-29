@@ -1,8 +1,10 @@
 # utils/log.py
 import logging
 import sys
+from logging.handlers import RotatingFileHandler # 导入
+from pathlib import Path
 
-def setup_logger(log_level=logging.INFO, log_file=None):
+def setup_logger(log_level=logging.INFO, log_file=None,max_bytes=5*1024*1024, backup_count=5):
     """
     配置并返回一个logger实例。
     """
@@ -23,7 +25,10 @@ def setup_logger(log_level=logging.INFO, log_file=None):
 
     # 文件处理器 (可选)
     if log_file:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        # 当日志文件达到 max_bytes 时，会重命名为 log_file.1, log_file.2 ...
+        # 最多保留 backup_count 个备份文件。当创建新文件时，最旧的备份会被删除。
+        file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, 
+                                           backupCount=backup_count, encoding='utf-8')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     
@@ -33,4 +38,7 @@ def setup_logger(log_level=logging.INFO, log_file=None):
 # logger = setup_logger() 
 # 如果希望在导入时就配置好，可以直接调用，或者让 main.py 来调用并传递实例
 # 为简单起见，这里直接创建一个默认logger供其他模块导入
-logger = setup_logger(log_file="simulation.log") # 日志会输出到控制台和 simulation.log 文件
+SIMULATION_LOG_PATH = Path(__file__).resolve().parent.parent / "simulation.log"
+logger = setup_logger(log_file=str(SIMULATION_LOG_PATH), 
+                      max_bytes=2*1024*1024, # 例如，每个日志文件最大2MB
+                      backup_count=3)         # 保留最近3个备份 + 当前日志文件

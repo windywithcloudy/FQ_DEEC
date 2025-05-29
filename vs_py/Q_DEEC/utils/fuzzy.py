@@ -16,24 +16,16 @@ if not logger.handlers: # 防止重复添加handler
 # Fuzzy System for Normal Node Selecting a Cluster Head (CH)
 # =============================================================================
 class NormalNodeCHSelectionFuzzySystem:
-    def __init__(self, node_sum, cluster_sum):
-        """
-        Initializes the fuzzy control system for CH selection by a normal node.
-        Args:
-            node_sum (int): Total number of nodes in the network.
-            cluster_sum (int): Current number of clusters (CHs) in the network.
-        """
-        if cluster_sum <= 0:
-            self.avg_load_per_ch = node_sum / 1.0 if node_sum > 0 else 10 
-        else:
-            self.avg_load_per_ch = node_sum / cluster_sum
-        
+    def __init__(self, main_sim_config): # 接收主config
+        self.main_config = main_sim_config
+        # self.fuzzy_specific_config = self.main_config.get('fuzzy', {}).get('normal_node_select_ch', {}) # 不再需要这个子配置
+
         # --- Antecedents (Inputs) ---
-        self.d_c_base = None           # Distance: CH to Base Station
-        self.e_cluster = None          # Energy: CH's Normalized Remaining Energy
-        self.p_cluster_ratio = None    # Load: CH's Current Load Ratio (actual_load / avg_load)
-        self.r_success = None          # Success Rate: Historical Comm. Success with CH (Normalized)
-        self.e_send_total_ratio = None # Send Energy: Hist. Avg. Send Energy to CH Ratio (actual_send_e / avg_send_e)
+        self.d_c_base = None           # Distance: CH to Base Station (实际距离)
+        self.e_cluster = None          # Energy: CH's Normalized Remaining Energy [0,1]
+        self.p_cluster_ratio = None    # Load: CH's Current Load Ratio (actual_load / avg_load) [e.g., 0-3]
+        self.r_success = None          # Success Rate: Historical Comm. Success with CH (Normalized [0,1])
+        self.e_send_total_ratio = None # Send Energy: Hist. Avg. Send Energy to CH Ratio (actual_send_e / avg_send_e_ref) [e.g., 0-3]
 
         # --- Consequents (Outputs) ---
         self.w_e_ch = None
@@ -41,15 +33,22 @@ class NormalNodeCHSelectionFuzzySystem:
         self.w_load = None
         self.w_dist_bs = None
 
-        self.control_system = None
-        self.simulation = None
-        self._build_system()
+        self._define_antecedents_and_consequents_once()
+        self.rules = self._define_rules_once() 
+        
+        if not self.rules:
+            logger.error("NormalNodeCHSelectionFuzzySystem: No rules defined! System will not work.")
+            self.control_system = None
+        else:
+            self.control_system = ctrl.ControlSystem(self.rules)
+            logger.info("NormalNodeCHSelectionFuzzySystem: ControlSystem built successfully.")
 
-    def _define_antecedents(self):
+    def _define_antecedents_and_consequents_once(self):
+        logger.debug("Defining antecedents and consequents for NormalNodeCHSelectionFuzzySystem...")
         # 1. D_c_base
         max_dist_val = 250 * np.sqrt(2) 
         universe_dc_base = np.arange(0, max_dist_val + 1, 1)
-        self.d_c_base = ctrl.Antecedent(universe_dc_base, 'd_c_base')
+        self.d_c_base = ctrl.Antecedent(universe_dc_base, 'd_c_base') # 标签与输入键匹配
         mid_dist_point = max_dist_val / 2
         self.d_c_base['Near'] = fuzz.zmf(self.d_c_base.universe, mid_dist_point * 0.6, mid_dist_point) 
         self.d_c_base['Medium'] = fuzz.trimf(self.d_c_base.universe, [mid_dist_point * 0.6, mid_dist_point, mid_dist_point * 1.4])
@@ -57,35 +56,34 @@ class NormalNodeCHSelectionFuzzySystem:
 
         # 2. E_cluster
         universe_e_cluster = np.arange(0, 1.01, 0.01)
-        self.e_cluster = ctrl.Antecedent(universe_e_cluster, 'e_cluster')
+        self.e_cluster = ctrl.Antecedent(universe_e_cluster, 'e_cluster') # 标签与输入键匹配
         self.e_cluster['Low'] = fuzz.zmf(self.e_cluster.universe, 0.2, 0.4)
         self.e_cluster['Medium'] = fuzz.trimf(self.e_cluster.universe, [0.3, 0.5, 0.7])
         self.e_cluster['High'] = fuzz.smf(self.e_cluster.universe, 0.6, 0.8)
 
         # 3. P_cluster_Ratio (Input will be actual_load / avg_load_per_ch)
         universe_p_cluster_ratio = np.arange(0, 3.01, 0.01) 
-        self.p_cluster_ratio = ctrl.Antecedent(universe_p_cluster_ratio, 'p_cluster_ratio')
+        self.p_cluster_ratio = ctrl.Antecedent(universe_p_cluster_ratio, 'p_cluster_ratio') # 标签与输入键匹配
         self.p_cluster_ratio['Low'] = fuzz.zmf(self.p_cluster_ratio.universe, 0.5, 1.0)
         self.p_cluster_ratio['Medium'] = fuzz.trimf(self.p_cluster_ratio.universe, [0.75, 1.25, 1.75])
         self.p_cluster_ratio['High'] = fuzz.smf(self.p_cluster_ratio.universe, 1.5, 2.0)
 
         # 4. R_success
         universe_r_success = np.arange(0, 1.01, 0.01)
-        self.r_success = ctrl.Antecedent(universe_r_success, 'r_success')
+        self.r_success = ctrl.Antecedent(universe_r_success, 'r_success') # 标签与输入键匹配
         self.r_success['Low'] = fuzz.zmf(self.r_success.universe, 0.3, 0.6)
         self.r_success['Medium'] = fuzz.trimf(self.r_success.universe, [0.4, 0.7, 0.9])
         self.r_success['High'] = fuzz.smf(self.r_success.universe, 0.7, 0.95)
 
-        # 5. E_send_total_Ratio (Input will be actual_e_send / avg_e_send_total_for_normal_node)
-        # Assuming avg_e_send_total_for_normal_node will be passed or handled similarly to avg_load
+        # 5. E_send_total_Ratio (Input will be actual_e_send / avg_e_send_ref)
         universe_e_send_ratio = np.arange(0, 3.01, 0.01)
-        self.e_send_total_ratio = ctrl.Antecedent(universe_e_send_ratio, 'e_send_total_ratio')
+        self.e_send_total_ratio = ctrl.Antecedent(universe_e_send_ratio, 'e_send_total_ratio') # 标签与输入键匹配
         self.e_send_total_ratio['Low'] = fuzz.zmf(self.e_send_total_ratio.universe, 0.5, 1.0)
         self.e_send_total_ratio['Medium'] = fuzz.trimf(self.e_send_total_ratio.universe, [0.75, 1.25, 1.75])
         self.e_send_total_ratio['High'] = fuzz.smf(self.e_send_total_ratio.universe, 1.5, 2.0)
-
-    def _define_consequents(self):
-        universe_weights = np.arange(0, 1.01, 0.01)
+        
+        # --- Consequents ---
+        universe_weights = np.arange(0, 1.01, 0.01) # 输出权重范围 [0,1]
         self.w_e_ch = ctrl.Consequent(universe_weights, 'w_e_ch')
         self.w_path = ctrl.Consequent(universe_weights, 'w_path')
         self.w_load = ctrl.Consequent(universe_weights, 'w_load')
@@ -95,8 +93,11 @@ class NormalNodeCHSelectionFuzzySystem:
             output_var['Low'] = fuzz.zmf(output_var.universe, 0.2, 0.4)
             output_var['Medium'] = fuzz.trimf(output_var.universe, [0.3, 0.5, 0.7])
             output_var['High'] = fuzz.smf(output_var.universe, 0.6, 0.8)
+        logger.debug("Antecedents and consequents for NormalNodeCHSelection defined.")
 
-    def _define_rules(self):
+
+    def _define_rules_once(self):
+        logger.debug("Defining fuzzy rules for NormalNodeCHSelection...")
         rules = []
         # Rules for w_e_ch
         rules.append(ctrl.Rule(self.e_cluster['Low'], self.w_e_ch['Low']))
@@ -130,51 +131,47 @@ class NormalNodeCHSelectionFuzzySystem:
         rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['Medium'], self.w_dist_bs['Medium']))
         rules.append(ctrl.Rule(self.d_c_base['Far'] & self.e_cluster['Low'], self.w_dist_bs['High']))
         rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['Low'], self.w_dist_bs['High']))
+        
+        if not rules: # Default rules if none are defined (should not happen with above)
+            logger.warning("NormalNodeCHSelectionFuzzySystem: No specific rules, adding default.")
+            # ... (add some truly default rules if necessary) ...
+        logger.debug(f"Defined {len(rules)} rules for NormalNodeCHSelectionFuzzySystem.")
         return rules
 
-    def _build_system(self):
-        self._define_antecedents()
-        self._define_consequents()
-        rules = self._define_rules()
-        self.control_system = ctrl.ControlSystem(rules)
-        self.simulation = ctrl.ControlSystemSimulation(self.control_system)
-
-    def compute_weights(self, current_dc_base, current_e_cluster, current_p_cluster_actual, 
-                        current_r_success, current_e_send_total_actual, avg_e_send_total_for_normal_node):
-        if self.simulation is None:
-            raise Exception("Fuzzy system not built.")
-
-        p_cluster_ratio_val = current_p_cluster_actual / self.avg_load_per_ch if self.avg_load_per_ch > 0 else 0
-        p_cluster_ratio_val = np.clip(p_cluster_ratio_val, self.p_cluster_ratio.universe.min(), self.p_cluster_ratio.universe.max())
-
-        # Use passed avg_e_send_total_for_normal_node for normalization
-        current_avg_e_send = avg_e_send_total_for_normal_node if avg_e_send_total_for_normal_node > 0 else 0.01 
-        e_send_total_ratio_val = current_e_send_total_actual / current_avg_e_send
-        e_send_total_ratio_val = np.clip(e_send_total_ratio_val, self.e_send_total_ratio.universe.min(), self.e_send_total_ratio.universe.max())
+    def compute_weights(self, current_dc_base, current_e_cluster_normalized, 
+                        current_p_cluster_ratio_val, # 接收已计算的比率
+                        current_r_success_normalized, 
+                        current_e_send_total_ratio_val):  # 接收已计算的比率
         
-        self.simulation.input['d_c_base'] = np.clip(current_dc_base, self.d_c_base.universe.min(), self.d_c_base.universe.max())
-        self.simulation.input['e_cluster'] = np.clip(current_e_cluster, self.e_cluster.universe.min(), self.e_cluster.universe.max())
-        self.simulation.input['p_cluster_ratio'] = p_cluster_ratio_val
-        self.simulation.input['r_success'] = np.clip(current_r_success, self.r_success.universe.min(), self.r_success.universe.max())
-        self.simulation.input['e_send_total_ratio'] = e_send_total_ratio_val
+        if self.control_system is None:
+            logger.error("NormalNodeCHSelectionFuzzySystem: ControlSystem is not built.")
+            return {'w_e_ch': 0.5, 'w_path': 0.5, 'w_load': 0.5, 'w_dist_bs': 0.5} # Neutral weights
+
+        simulation = ctrl.ControlSystemSimulation(self.control_system) # Create new simulation instance
+
+        # --- 裁剪并设置输入值 ---
+        simulation.input['d_c_base'] = np.clip(current_dc_base, self.d_c_base.universe.min(), self.d_c_base.universe.max())
+        simulation.input['e_cluster'] = np.clip(current_e_cluster_normalized, self.e_cluster.universe.min(), self.e_cluster.universe.max())
+        simulation.input['p_cluster_ratio'] = np.clip(current_p_cluster_ratio_val, self.p_cluster_ratio.universe.min(), self.p_cluster_ratio.universe.max())
+        simulation.input['r_success'] = np.clip(current_r_success_normalized, self.r_success.universe.min(), self.r_success.universe.max())
+        simulation.input['e_send_total_ratio'] = np.clip(current_e_send_total_ratio_val, self.e_send_total_ratio.universe.min(), self.e_send_total_ratio.universe.max())
         
+        output_dict = {}
         try:
-            self.simulation.compute()
-            return {
-                'w_e_ch': self.simulation.output['w_e_ch'],
-                'w_path': self.simulation.output['w_path'],
-                'w_load': self.simulation.output['w_load'],
-                'w_dist_bs': self.simulation.output['w_dist_bs']
+            simulation.compute()
+            output_vars_to_get = {
+                'w_e_ch': 0.5, 'w_path': 0.5, 'w_load': 0.5, 'w_dist_bs': 0.5 # Default to neutral if key missing
             }
+            for var_name, default_val in output_vars_to_get.items():
+                try:
+                    output_dict[var_name] = simulation.output[var_name]
+                except KeyError:
+                    logger.warning(f"NormalNodeFuzzy: Output var '{var_name}' not found in simulation.output, using default {default_val}.")
+                    output_dict[var_name] = default_val
+            return output_dict
         except Exception as e:
-            print(f"Error in NormalNodeCHSelectionFuzzySystem computation: {e}")
-            # Provide input values for debugging
-            print(f"Inputs: dc_base={self.simulation.input.get('d_c_base', 'N/A')}, "
-                  f"e_cluster={self.simulation.input.get('e_cluster', 'N/A')}, "
-                  f"p_cluster_ratio={self.simulation.input.get('p_cluster_ratio', 'N/A')}, "
-                  f"r_success={self.simulation.input.get('r_success', 'N/A')}, "
-                  f"e_send_total_ratio={self.simulation.input.get('e_send_total_ratio', 'N/A')}")
-            return {'w_e_ch': 0.5, 'w_path': 0.5, 'w_load': 0.5, 'w_dist_bs': 0.5} # Default/neutral
+            logger.error(f"Error in NormalNodeCHSelectionFuzzySystem compute: {e}", exc_info=True)
+            return {'w_e_ch': 0.5, 'w_path': 0.5, 'w_load': 0.5, 'w_dist_bs': 0.5}
 
     def view_antecedent(self, name):
         if hasattr(self, name) and getattr(self, name) is not None:
