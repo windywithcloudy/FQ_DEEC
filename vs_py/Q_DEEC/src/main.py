@@ -49,7 +49,7 @@ def main():
                 break
             
             # 可视化当前轮次的分簇结果
-            if (r + 1) % viz_interval == 0 or r == 0 or r == total_rounds -1 : # 首轮、末轮、按间隔可视化
+            if (r + 1) % viz_interval == 0 or r == 0 or r == total_rounds -1 : 
                 output_image_file = REPORTS_DIR / f"network_round_{r+1:04d}.png"
                 visualize_network(
                     nodes_data=environment.nodes,
@@ -57,7 +57,8 @@ def main():
                     area_dims=environment.config['network']['area_size'],
                     filename=str(output_image_file),
                     current_round=r + 1,
-                    candidate_ch_ids=environment.candidate_cluster_heads, # 传递候选CH ID
+                    # 传递本epoch确认的CH列表
+                    confirmed_chs_in_epoch=environment.confirmed_cluster_heads_for_epoch, 
                     config=environment.config 
                 )
         

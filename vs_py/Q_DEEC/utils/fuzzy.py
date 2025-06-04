@@ -100,13 +100,21 @@ class NormalNodeCHSelectionFuzzySystem:
         logger.debug("Defining fuzzy rules for NormalNodeCHSelection...")
         rules = []
         # Rules for w_e_ch
+        # 修复覆盖漏洞并减少冲突
         rules.append(ctrl.Rule(self.e_cluster['Low'], self.w_e_ch['Low']))
-        rules.append(ctrl.Rule(self.e_cluster['Medium'] & (self.d_c_base['Far'] | self.p_cluster_ratio['High']), self.w_e_ch['Low']))
-        rules.append(ctrl.Rule(self.e_cluster['Medium'] & (self.d_c_base['Medium'] | self.p_cluster_ratio['Medium']), self.w_e_ch['Medium']))
-        rules.append(ctrl.Rule(self.e_cluster['High'] & (self.d_c_base['Far'] | self.p_cluster_ratio['High']), self.w_e_ch['Medium']))
-        rules.append(ctrl.Rule(self.e_cluster['Medium'] & (self.d_c_base['Near'] | self.p_cluster_ratio['Low']), self.w_e_ch['High']))
-        rules.append(ctrl.Rule(self.e_cluster['High'] & (self.d_c_base['Medium'] | self.p_cluster_ratio['Medium']), self.w_e_ch['High']))
-        rules.append(ctrl.Rule(self.e_cluster['High'] & (self.d_c_base['Near'] | self.p_cluster_ratio['Low']), self.w_e_ch['High']))
+
+        # Medium 集群规则优化
+        rules.append(ctrl.Rule(self.e_cluster['Medium'] & self.d_c_base['Far'] & self.p_cluster_ratio['High'], self.w_e_ch['Low']))
+        rules.append(ctrl.Rule(self.e_cluster['Medium'] & self.d_c_base['Far'] & (self.p_cluster_ratio['Medium'] | self.p_cluster_ratio['Low']), self.w_e_ch['Medium']))
+        rules.append(ctrl.Rule(self.e_cluster['Medium'] & self.d_c_base['Medium'], self.w_e_ch['Medium']))
+        rules.append(ctrl.Rule(self.e_cluster['Medium'] & self.d_c_base['Near'] & self.p_cluster_ratio['High'], self.w_e_ch['Medium']))
+        rules.append(ctrl.Rule(self.e_cluster['Medium'] & self.d_c_base['Near'] & (self.p_cluster_ratio['Medium'] | self.p_cluster_ratio['Low']), self.w_e_ch['High']))
+
+        # High 集群规则优化
+        rules.append(ctrl.Rule(self.e_cluster['High'] & self.d_c_base['Far'] & self.p_cluster_ratio['High'], self.w_e_ch['Medium']))
+        rules.append(ctrl.Rule(self.e_cluster['High'] & self.d_c_base['Far'] & (self.p_cluster_ratio['Medium'] | self.p_cluster_ratio['Low']), self.w_e_ch['High']))
+        rules.append(ctrl.Rule(self.e_cluster['High'] & self.d_c_base['Medium'], self.w_e_ch['High']))
+        rules.append(ctrl.Rule(self.e_cluster['High'] & self.d_c_base['Near'], self.w_e_ch['High']))
 
         # Rules for w_path
         rules.append(ctrl.Rule(self.r_success['High'] & (self.e_send_total_ratio['Low'] | self.e_send_total_ratio['Medium']), self.w_path['Low']))
@@ -124,13 +132,13 @@ class NormalNodeCHSelectionFuzzySystem:
         rules.append(ctrl.Rule(self.p_cluster_ratio['Low'] & (self.e_cluster['Medium'] | self.e_cluster['High']), self.w_load['Low']))
 
         # Rules for w_dist_bs
+        # 优化后版本（5条规则）
         rules.append(ctrl.Rule(self.d_c_base['Near'], self.w_dist_bs['Low']))
-        rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['High'], self.w_dist_bs['Low']))
-        rules.append(ctrl.Rule(self.d_c_base['Far'] & self.e_cluster['Medium'], self.w_dist_bs['Medium']))
-        rules.append(ctrl.Rule(self.d_c_base['Far'] & self.e_cluster['High'], self.w_dist_bs['Medium']))
-        rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['Medium'], self.w_dist_bs['Medium']))
-        rules.append(ctrl.Rule(self.d_c_base['Far'] & self.e_cluster['Low'], self.w_dist_bs['High']))
         rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['Low'], self.w_dist_bs['High']))
+        rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['Medium'], self.w_dist_bs['Medium']))
+        rules.append(ctrl.Rule(self.d_c_base['Medium'] & self.e_cluster['High'], self.w_dist_bs['Low']))
+        rules.append(ctrl.Rule(self.d_c_base['Far'] & self.e_cluster['Low'], self.w_dist_bs['High']))
+        rules.append(ctrl.Rule(self.d_c_base['Far'] & (self.e_cluster['Medium'] | self.e_cluster['High']), self.w_dist_bs['Medium']))
         
         if not rules: # Default rules if none are defined (should not happen with above)
             logger.warning("NormalNodeCHSelectionFuzzySystem: No specific rules, adding default.")
@@ -190,18 +198,15 @@ class NormalNodeCHSelectionFuzzySystem:
 # Fuzzy System for Cluster Head (CH) Selecting Path to Base Station (BS)
 # =============================================================================
 class CHToBSPathSelectionFuzzySystem:
-    def __init__(self, node_sum, cluster_sum): # Add other necessary averages if needed
+    def __init__(self, main_sim_config): # Add other necessary averages if needed
         """
         Initializes the fuzzy control system for CH selecting path to BS.
         Args:
             node_sum (int): Total number of nodes.
             cluster_sum (int): Current number of CHs.
         """
-        if cluster_sum <= 0:
-            self.avg_load_per_ch_for_neighbor = node_sum / 1.0 if node_sum > 0 else 10
-        else:
-            self.avg_load_per_ch_for_neighbor = node_sum / cluster_sum
-        
+        self.main_config = main_sim_config
+        self.p_opt_reference = float(self.main_config.get('deec', {}).get('p_opt', 0.1)) # 否则用deec的p_opt
         # --- Antecedents (Inputs) ---
         self.d_c_bs_neighbor = None     # Distance: Neighbor CH to BS
         self.e_c_neighbor = None        # Energy: Neighbor CH's Normalized Remaining Energy
@@ -212,7 +217,7 @@ class CHToBSPathSelectionFuzzySystem:
 
         # For simplicity, LQ_c and E_ctx_cost are assumed to be directly normalized to [0,1] for now
         # Or you can pass their respective averages to __init__ like avg_load
-        self.lq_c_normalized = None     # Link Quality: Normalized [0,1]
+        #self.lq_c_normalized = None     # Link Quality: Normalized [0,1]
         self.e_ctx_cost_normalized = None # CTX Cost: Normalized [0,1]
 
 
@@ -222,11 +227,31 @@ class CHToBSPathSelectionFuzzySystem:
         self.w_fur = None    # Sustainability/Future energy weight
         self.w_load_neighbor = None # Neighbor load weight (renamed from w_load to be specific)
 
-        self.control_system = None
-        self.simulation = None
-        self._build_system()
+        self._define_antecedents_and_consequents_once()
+        self.rules = self._define_rules_once() 
+        
+        if not self.rules:
+            logger.error("CHToBSPathSelectionFuzzySystem: No rules defined!")
+            self.control_system = None
+            # 确保即使control_system为None，后续也不会尝试创建simulation或引发错误
+            # 或者在这里创建一个最小的、包含所有预期输入输出的空规则系统用于测试结构
+            # 但更好的做法是确保规则被正确定义
+        else:
+            try:
+                self.control_system = ctrl.ControlSystem(self.rules)
+                logger.info("CHToBSPathSelectionFuzzySystem: ControlSystem built successfully.")
+                
+                # --- 调试打印 ControlSystem 的 Antecedents ---
+                logger.debug("Antecedents registered in ControlSystem:")
+                for antecedent in self.control_system.antecedents: # antecedents 是一个迭代器
+                    logger.debug(f"  - Antecedent Label: '{antecedent.label}', Universe: {antecedent.universe.shape}")
+                # --- 调试打印结束 ---
 
-    def _define_antecedents(self):
+            except Exception as e:
+                logger.error(f"Error creating ControlSystem: {e}", exc_info=True)
+                self.control_system = None
+
+    def _define_antecedents_and_consequents_once(self):
         # 1. D_c_bs_neighbor (Distance: Neighbor CH to BS)
         max_dist_val = 250 * np.sqrt(2)
         universe_dc_bs_neighbor = np.arange(0, max_dist_val + 1, 1)
@@ -264,7 +289,6 @@ class CHToBSPathSelectionFuzzySystem:
         self.e_ctx_cost_normalized['Medium'] = fuzz.trimf(self.e_ctx_cost_normalized.universe, [0.3, 0.5, 0.7])
         self.e_ctx_cost_normalized['High'] = fuzz.smf(self.e_ctx_cost_normalized.universe, 0.6, 0.8)
 
-    def _define_consequents(self):
         universe_weights = np.arange(0, 1.01, 0.01)
         self.w_d_pro = ctrl.Consequent(universe_weights, 'w_d_pro')
         self.w_e_cost = ctrl.Consequent(universe_weights, 'w_e_cost')
@@ -276,7 +300,7 @@ class CHToBSPathSelectionFuzzySystem:
             output_var['Medium'] = fuzz.trimf(output_var.universe, [0.3, 0.5, 0.7])
             output_var['High'] = fuzz.smf(output_var.universe, 0.6, 0.8)
     
-    def _define_rules(self):
+    def _define_rules_once(self):
         rules = []
         # Rules for w_d_pro
         rules.append(ctrl.Rule(self.r_c_success['High'], self.w_d_pro['High']))
@@ -293,12 +317,41 @@ class CHToBSPathSelectionFuzzySystem:
         rules.append(ctrl.Rule(self.r_c_success['Low'], self.w_e_cost['High']))
 
         # Rules for w_fur
-        rules.append(ctrl.Rule(self.e_c_neighbor['High'] & (self.load_c_ratio['Low'] | self.load_c_ratio['Medium']) & 
-                               (self.d_c_bs_neighbor['Near'] | self.d_c_bs_neighbor['Medium']), self.w_fur['High']))
-        rules.append(ctrl.Rule(self.e_c_neighbor['High'] & self.load_c_ratio['High'] & self.d_c_bs_neighbor['Far'], self.w_fur['Medium']))
-        rules.append(ctrl.Rule(self.e_c_neighbor['Medium'] & (self.load_c_ratio['Low'] | self.load_c_ratio['Medium']) & 
-                               (self.d_c_bs_neighbor['Near'] | self.d_c_bs_neighbor['Medium']), self.w_fur['Medium']))
-        rules.append(ctrl.Rule(self.e_c_neighbor['Medium'] & self.load_c_ratio['High'] & self.d_c_bs_neighbor['Far'], self.w_fur['Low']))
+        # 简化后的规则集
+
+        # High输出规则
+        rules.append(ctrl.Rule(
+            self.e_c_neighbor['High'] & 
+            (self.load_c_ratio['Low'] | self.load_c_ratio['Medium']) & 
+            (self.d_c_bs_neighbor['Near'] | self.d_c_bs_neighbor['Medium']), 
+            self.w_fur['High']
+        ))
+
+        # Medium输出规则
+        rules.append(ctrl.Rule(
+            self.e_c_neighbor['High'] & 
+            (self.load_c_ratio['High'] | self.d_c_bs_neighbor['Far']), 
+            self.w_fur['Medium']
+        ))
+        rules.append(ctrl.Rule(
+            self.e_c_neighbor['Medium'] & 
+            (self.load_c_ratio['Low'] | self.load_c_ratio['Medium']), 
+            self.w_fur['Medium']
+        ))
+        rules.append(ctrl.Rule(
+            self.e_c_neighbor['Medium'] & 
+            self.load_c_ratio['High'] & 
+            self.d_c_bs_neighbor['Near'], 
+            self.w_fur['Medium']
+        ))
+
+        # Low输出规则
+        rules.append(ctrl.Rule(
+            self.e_c_neighbor['Medium'] & 
+            self.load_c_ratio['High'] & 
+            (self.d_c_bs_neighbor['Medium'] | self.d_c_bs_neighbor['Far']), 
+            self.w_fur['Low']
+        ))
         rules.append(ctrl.Rule(self.e_c_neighbor['Low'], self.w_fur['Low']))
         
         # Rules for w_load_neighbor
@@ -308,49 +361,99 @@ class CHToBSPathSelectionFuzzySystem:
         rules.append(ctrl.Rule(self.load_c_ratio['Low'] & self.e_c_neighbor['Low'], self.w_load_neighbor['Medium']))
         rules.append(ctrl.Rule(self.load_c_ratio['Medium'] & self.e_c_neighbor['High'], self.w_load_neighbor['Low']))
         rules.append(ctrl.Rule(self.load_c_ratio['Low'] & (self.e_c_neighbor['Medium'] | self.e_c_neighbor['High']), self.w_load_neighbor['Low']))
+        if not rules:
+            logger.warning("CHToBSPathSelectionFuzzySystem: No specific rules, adding default.")
+            # ... (添加默认规则的逻辑，确保所有输出都有一个默认规则)
+            default_antecedent = self.e_c_neighbor['Medium'] # Pick one antecedent for default
+            for out_var in [self.w_d_pro, self.w_e_cost, self.w_fur, self.w_load_neighbor]:
+                if hasattr(out_var, 'terms') and 'Medium' in out_var.terms: # Assuming 'Medium' for outputs
+                     rules.append(ctrl.Rule(default_antecedent, out_var['Medium']))
+                elif hasattr(out_var, 'terms') and 'Neutral' in out_var.terms: # If you used Neutral for factors
+                     rules.append(ctrl.Rule(default_antecedent, out_var['Neutral']))
+                else:
+                     logger.error(f"Cannot add default rule for {out_var.label} as 'Medium' or 'Neutral' MF is not defined.")
+
+        logger.debug(f"Defined {len(rules)} rules for CHToBSPathSelectionFuzzySystem.")
         return rules
 
-    def _build_system(self):
-        self._define_antecedents()
-        self._define_consequents()
-        rules = self._define_rules()
-        self.control_system = ctrl.ControlSystem(rules)
-        self.simulation = ctrl.ControlSystemSimulation(self.control_system)
-
     def compute_weights(self, current_dc_bs_neighbor, current_e_c_neighbor, 
-                         current_load_c_actual, current_r_c_success, current_e_ctx_cost_normalized,
-                        avg_load_for_neighbor_ch): # Pass the relevant average load
-        if self.simulation is None:
-            raise Exception("Fuzzy system not built.")
-
-        # Normalize dynamic inputs (only load_c needs it here based on current design)
-        current_avg_load = avg_load_for_neighbor_ch if avg_load_for_neighbor_ch > 0 else self.avg_load_per_ch_for_neighbor # Fallback
-        load_c_ratio_val = current_load_c_actual / current_avg_load if current_avg_load > 0 else 0
-        load_c_ratio_val = np.clip(load_c_ratio_val, self.load_c_ratio.universe.min(), self.load_c_ratio.universe.max())
+                        # current_lq_c_normalized, # 已移除
+                        current_load_c_actual, current_r_c_success, 
+                        current_e_ctx_cost_normalized,
+                        avg_load_for_neighbor_ch):
         
-        self.simulation.input['d_c_bs_neighbor'] = np.clip(current_dc_bs_neighbor, self.d_c_bs_neighbor.universe.min(), self.d_c_bs_neighbor.universe.max())
-        self.simulation.input['e_c_neighbor'] = np.clip(current_e_c_neighbor, self.e_c_neighbor.universe.min(), self.e_c_neighbor.universe.max())
-        self.simulation.input['load_c_ratio'] = load_c_ratio_val
-        self.simulation.input['r_c_success'] = np.clip(current_r_c_success, self.r_c_success.universe.min(), self.r_c_success.universe.max())
-        self.simulation.input['e_ctx_cost_normalized'] = np.clip(current_e_ctx_cost_normalized, self.e_ctx_cost_normalized.universe.min(), self.e_ctx_cost_normalized.universe.max())
+        if self.control_system is None:
+            logger.error("CHToBSPathSelectionFuzzySystem: ControlSystem is not built.")
+            return {'w_d_pro': 0.5, 'w_e_cost': 0.5, 'w_fur': 0.5, 'w_load_neighbor': 0.5}
 
+        simulation = ctrl.ControlSystemSimulation(self.control_system)
+        
+        # --- 准备并裁剪输入值 ---
+        clipped_dc_bs_neighbor = np.clip(current_dc_bs_neighbor, self.d_c_bs_neighbor.universe.min(), self.d_c_bs_neighbor.universe.max())
+        clipped_e_c_neighbor = np.clip(current_e_c_neighbor, self.e_c_neighbor.universe.min(), self.e_c_neighbor.universe.max())
+        
+        current_avg_load = avg_load_for_neighbor_ch if avg_load_for_neighbor_ch > 0 else \
+                           (self.main_config.get('network',{}).get('node_count',100) / \
+                            max(1, self.p_opt_reference * self.main_config.get('network',{}).get('node_count',100) ) )
+        load_c_ratio_val = current_load_c_actual / current_avg_load if current_avg_load > 0 else 0
+        clipped_load_c_ratio = np.clip(load_c_ratio_val, self.load_c_ratio.universe.min(), self.load_c_ratio.universe.max())
+        
+        clipped_r_c_success = np.clip(current_r_c_success, self.r_c_success.universe.min(), self.r_c_success.universe.max())
+        clipped_e_ctx_cost_normalized = np.clip(current_e_ctx_cost_normalized, self.e_ctx_cost_normalized.universe.min(), self.e_ctx_cost_normalized.universe.max())
+
+        # --- 设置输入值 ---
+        simulation.input['d_c_bs_neighbor'] = clipped_dc_bs_neighbor
+        simulation.input['e_c_neighbor'] = clipped_e_c_neighbor
+        simulation.input['load_c_ratio'] = clipped_load_c_ratio
+        simulation.input['r_c_success'] = clipped_r_c_success
+        simulation.input['e_ctx_cost_normalized'] = clipped_e_ctx_cost_normalized
+        
+        output_dict = {}
         try:
-            self.simulation.compute()
-            return {
-                'w_d_pro': self.simulation.output['w_d_pro'],
-                'w_e_cost': self.simulation.output['w_e_cost'],
-                'w_fur': self.simulation.output['w_fur'],
-                'w_load_neighbor': self.simulation.output['w_load_neighbor']
+            logger.debug(f"--- Fuzzy Inputs for CHToBS (before compute) ---")
+            logger.debug(f"  d_c_bs_neighbor: {clipped_dc_bs_neighbor:.2f}")
+            logger.debug(f"  e_c_neighbor: {clipped_e_c_neighbor:.2f}")
+            logger.debug(f"  load_c_ratio: {clipped_load_c_ratio:.2f}")
+            logger.debug(f"  r_c_success: {clipped_r_c_success:.2f}")
+            logger.debug(f"  e_ctx_cost_normalized: {clipped_e_ctx_cost_normalized:.2f}")
+
+            simulation.compute() 
+            
+            # logger.debug(f"--- Raw Simulation Output CHToBS (after compute) ---")
+            # if hasattr(simulation, 'output') and isinstance(simulation.output, dict):
+            #     for key, value in simulation.output.items():
+            #         logger.debug(f"  Output '{key}': {value}")
+
+            output_vars_to_get = {
+                'w_d_pro': 0.5, 'w_e_cost': 0.5, 'w_fur': 0.5, 'w_load_neighbor': 0.5
             }
-        except Exception as e:
-            print(f"Error in CHToBSPathSelectionFuzzySystem computation: {e}")
-            print(f"Inputs: d_c_bs_neighbor={self.simulation.input.get('d_c_bs_neighbor', 'N/A')}, "
-                  f"e_c_neighbor={self.simulation.input.get('e_c_neighbor', 'N/A')}, "
-                  f"lq_c_normalized={self.simulation.input.get('lq_c_normalized', 'N/A')}, "
-                  f"load_c_ratio={self.simulation.input.get('load_c_ratio', 'N/A')}, "
-                  f"r_c_success={self.simulation.input.get('r_c_success', 'N/A')}, "
-                  f"e_ctx_cost_normalized={self.simulation.input.get('e_ctx_cost_normalized', 'N/A')}")
-            return {'w_d_pro': 0.5, 'w_e_cost': 0.5, 'w_fur': 0.5, 'w_load_neighbor': 0.5} # Default
+            
+            for var_name, default_val in output_vars_to_get.items():
+                try:
+                    output_dict[var_name] = simulation.output[var_name]
+                except KeyError:
+                    logger.warning(f"CHToBSFuzzy: Output var '{var_name}' not found in simulation.output, using default {default_val}.")
+                    # *** 修改这里的调试打印 ***
+                    logger.warning(f"  Problematic Inputs that led to missing '{var_name}':")
+                    logger.warning(f"    d_c_bs_neighbor (clipped): {clipped_dc_bs_neighbor:.3f}")
+                    logger.warning(f"    e_c_neighbor (clipped): {clipped_e_c_neighbor:.3f}")
+                    logger.warning(f"    load_c_ratio (clipped): {clipped_load_c_ratio:.3f}")
+                    logger.warning(f"    r_c_success (clipped): {clipped_r_c_success:.3f}")
+                    logger.warning(f"    e_ctx_cost_normalized (clipped): {clipped_e_ctx_cost_normalized:.3f}")
+                    # *************************
+                    output_dict[var_name] = default_val
+                except TypeError: 
+                    logger.warning(f"CHToBSFuzzy: simulation.output is not dict for '{var_name}'. Using default.")
+                    output_dict[var_name] = default_val
+            return output_dict
+
+        except Exception as e: 
+            logger.error(f"Error in CHToBSPathSelectionFuzzySystem compute: {e}", exc_info=True)
+            # 打印原始传入的参数
+            logger.error(f"  Original Inputs: dc_bs_neighbor={current_dc_bs_neighbor}, e_c_neighbor={current_e_c_neighbor}, "
+                         f"load_c_actual={current_load_c_actual}, r_c_success={current_r_c_success}, "
+                         f"e_ctx_cost_norm={current_e_ctx_cost_normalized}, avg_load_nh={avg_load_for_neighbor_ch}")
+            return {'w_d_pro': 0.5, 'w_e_cost': 0.5, 'w_fur': 0.5, 'w_load_neighbor': 0.5}
 
     def view_antecedent(self, name): # Same as in NormalNodeCHSelectionFuzzySystem
         if hasattr(self, name) and getattr(self, name) is not None:

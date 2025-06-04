@@ -29,7 +29,7 @@ energy:
   
 # 仿真控制
 simulation:
-  total_rounds: 50      # 总仿真轮数
+  total_rounds: 60      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
 
@@ -64,6 +64,10 @@ deec:
   location_factor_enabled: true     # 启用位置因子
   edge_penalty_factor: 0.3          # 边缘节点惩罚因子
   epoch_length: 20
+  ch_communication_range_base: 100 # CH的基础通信范围 (可以与普通节点不同，或相同)
+  ch_communication_range_max: 200  # CH允许的最大通信范围 (m)
+  ch_communication_range_steps: 4
+  ch_communication_range_increment: 25
   # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
   # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
                            # 对于初步集成，我们可以简化为每轮都可能重新选举
@@ -92,6 +96,8 @@ visualization:
     base_station: '#32CD32'
     dead_node: '#A9A9A9' # 如果需要区分死亡节点颜色
     direct_bs_node: '#FFD700' # 新增：直连BS节点的颜色 (例如金色)
+    ch_route_line: '#8A2BE2' # 紫罗兰色，用于CH间路由
+    ch_to_direct_node_route_line: '#FFA500' # 橙色，CH到直连BS节点的路由颜色
 
 q_learning:
   alpha_compete_ch: 0.1
@@ -99,6 +105,9 @@ q_learning:
   epsilon_compete_ch_initial: 0.6 # 初始探索率高一些
   epsilon_compete_ch_decay: 0.995
   epsilon_compete_ch_min: 0.01
+  ch_switching_hysteresis: 5.0 # 新增：普通节点切换CH的Q值滞后阈值 (奖励单位)
+  alpha_ch_hop: 0.1
+  gamma_ch_hop: 0.9
   # 可以为普通节点选择CH的Q学习也添加类似参数
 
 rewards:
@@ -121,3 +130,11 @@ rewards:
     dist_bs_component_scale: 10.0 # 用于缩放CH到BS距离项的贡献
     # ideal_members_per_ch_ref: 5 # 理想的每个CH服务的成员数参考值 (用于负载奖励) 
                                   # 这个也可以在代码中动态计算
+  ch_select_next_hop:
+    reach_bs_bonus: 100
+    transmission_fail_penalty: -100
+    data_progress_unit: 1.0
+    energy_cost_penalty_unit: 2000
+    next_hop_low_energy_penalty_unit: -20
+    next_hop_high_load_penalty_unit: -15
+    reach_bs_via_direct_node_bonus: 10 # 新增：通过直连节点到达BS的奖励
