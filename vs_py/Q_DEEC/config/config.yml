@@ -29,9 +29,10 @@ energy:
   
 # 仿真控制
 simulation:
-  total_rounds: 60      # 总仿真轮数
+  total_rounds: 2000      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
+  max_packet_hops: 10       #最大跳数
 
 # 可视化设置
 visualization:
@@ -138,3 +139,27 @@ rewards:
     next_hop_low_energy_penalty_unit: -20
     next_hop_high_load_penalty_unit: -15
     reach_bs_via_direct_node_bonus: 10 # 新增：通过直连节点到达BS的奖励
+
+discretization_params:
+  energy: # 归一化能量
+    num_bins: 5 # 如果使用等宽分箱
+    custom_boundaries: [0.25, 0.55, 0.85, 0.95]
+    # 或者使用自定义边界 (如果选择这种方式，则 num_bins 可以省略或不使用)
+    # custom_boundaries: [0.2, 0.4, 0.6, 0.8] # 定义了5个区间: <0.2, 0.2-0.4, ..., >=0.8
+
+  time_since_last_ch:
+    boundaries: [10,30,60] # 定义3个状态: <=20, >20 & <=60, >60
+
+  neighbor_count:
+    # 使用相对参考值的方式，或者也可以定义绝对边界
+    # 如果用相对参考值，max_neighbors_ref_factor 可能需要从其他地方获取或在此定义
+    # 这里我们先用绝对边界示例，如果需要相对的，则需要在代码中处理
+    num_bins: 3
+    # 或者自定义边界，例如：
+    # boundaries: [5, 15] # <=5, >5 & <=15, >15
+
+  ch_count_nearby:
+    boundaries: [0, 2, 4] # =0, =1 or =2, >2
+
+  distance_to_bs_normalized:
+    boundaries: [0.22, 0.35, 0.48] 

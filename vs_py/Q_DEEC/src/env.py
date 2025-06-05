@@ -7,7 +7,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from utils.log import logger # 从 utils 包导入 logger
 from utils.fuzzy import NormalNodeCHSelectionFuzzySystem, RewardWeightsFuzzySystemForCHCompetition,CHToBSPathSelectionFuzzySystem
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def _poisson_disk_sampling(width, height, min_dist, num_nodes_target, k_samples):
     """
@@ -180,6 +180,28 @@ class WSNEnv:
         self.ch_switching_hysteresis = float(q_learning_cfg.get('ch_switching_hysteresis', 5.0)) # 新增：切换滞后阈值
         self.current_epsilon_compete = self.epsilon_compete_initial
         self.competition_log_for_current_epoch = {}
+
+        self.disc_params = self.config.get('discretization_params', {})
+        # 为每个状态获取其参数，并提供默认值以防配置缺失
+        self.energy_disc_bins = self.disc_params.get('energy', {}).get('num_bins', 5)
+        # self.energy_disc_boundaries = self.disc_params.get('energy', {}).get('custom_boundaries', [0.2, 0.4, 0.6, 0.8])
+        self.time_disc_boundaries = self.disc_params.get('time_since_last_ch', {}).get('boundaries', [20, 60])     
+        self.neighbor_count_disc_bins = self.disc_params.get('neighbor_count', {}).get('num_bins', 3)
+        # self.neighbor_count_disc_boundaries = self.disc_params.get('neighbor_count', {}).get('boundaries', [5, 15])
+        self.ch_count_disc_boundaries = self.disc_params.get('ch_count_nearby', {}).get('boundaries', [0, 2])    
+        self.dist_bs_disc_boundaries = self.disc_params.get('distance_to_bs_normalized', {}).get('boundaries', [0.25, 0.75])
+
+        self.sim_packets_generated_total = 0
+        self.sim_packets_delivered_bs_total = 0
+        self.sim_total_delay_for_delivered_packets = 0.0 # 如果计算精确时延
+        self.sim_total_hops_for_delivered_packets_this_round = 0 # 如果用跳数作代理
+        self.sim_num_packets_counted_for_hops_this_round = 0   # 如果用跳数作代理
+        
+        self.sim_packets_generated_this_round = 0
+        self.sim_packets_delivered_bs_this_round = 0 # <<< --- 这个是报错的属性 ---
+        self.sim_total_delay_this_round = 0.0 # 如果计算精确时延
+        self.sim_num_packets_for_delay_this_round = 0 # 如果计算精确时延
+
         self.ch_path_fuzzy_logic = CHToBSPathSelectionFuzzySystem(self.config)
         if not hasattr(self, 'reward_weights_adjuster'):
             from utils.fuzzy import RewardWeightsFuzzySystemForCHCompetition
@@ -253,11 +275,14 @@ class WSNEnv:
                 "status": "active", # 可以添加其他初始状态
                 "neighbors":[],
                 "current_data_path":[],
+                "source_ch_of_current_packet" : -1,
+                "gen_round_of_current_packet" :-1,
                 "role": "normal", # 新增：normal, cluster_head
                 "cluster_id": -1, # 所属簇头的ID，-1表示未加入任何簇
                 "time_since_last_ch": random.randint(0, 20), # 初始随机化，避免同步
                 "q_table_compete_ch": {}, 
                 "q_table_select_ch": {}, # 用于普通节点选择CH的Q表
+                "q_table_select_next_hop": {},
                 # 使用从config加载的Q学习参数
                 "alpha_compete": self.alpha_compete,
                 "gamma_compete": self.gamma_compete,
@@ -275,36 +300,39 @@ class WSNEnv:
              logger.warning(f"最终生成的节点数量 ({len(self.nodes)}) 与位置数量 ({len(node_positions)}) 不符。")
     
     def discretize_normalized_energy(self, normalized_energy, num_bins=5):
-        # ... (如之前定义) ...
+        num_bins = self.energy_disc_bins
         if not (0 <= normalized_energy <= 1.0001):
             normalized_energy = np.clip(normalized_energy, 0, 1)
         return min(int(normalized_energy * num_bins), num_bins - 1)
+        # 如果使用自定义边界:
+        # boundaries = self.energy_disc_boundaries 
+        # return np.digitize(normalized_energy, boundaries, right=False) # right=False: [b1, b2), right=True: (b1, b2]
 
     def discretize_time_since_last_ch(self, rounds_since_last_ch):
-        # ... (如之前定义) ...
-        if rounds_since_last_ch <= 20: return 0
-        elif rounds_since_last_ch <= 60: return 1
-        else: return 2
+        # np.digitize 会返回一个索引，0表示小于第一个边界，1表示在第一和第二个边界之间，以此类推
+        # boundaries = [20, 60] -> 3 states: val <= 20 (state 0), 20 < val <= 60 (state 1), val > 60 (state 2)
+        return np.digitize(rounds_since_last_ch, self.time_disc_boundaries)
 
-    def discretize_neighbor_count(self, count, max_neighbors_ref=15, num_bins=3): # max_neighbors_ref 作为参考
-        # ... (如之前定义) ...
-        count = np.clip(count, 0, max_neighbors_ref * 1.5) # 允许略微超出参考最大值
-        if count <= max_neighbors_ref / 3: return 0      
-        elif count <= max_neighbors_ref * 2 / 3: return 1 
-        else: return 2  
+    def discretize_neighbor_count(self, count, max_neighbors_ref=None): # max_neighbors_ref 作为参考
+        # 示例：如果config中定义了 neighbor_count.boundaries
+        if 'boundaries' in self.disc_params.get('neighbor_count', {}):
+            return np.digitize(count, self.disc_params['neighbor_count']['boundaries'])
+        else: # 使用 num_bins 进行等宽分箱，需要一个大致的上限
+            # 这个上限最好也是可配置的或动态估算的
+            # 假设一个硬编码的上限，或者从config读取
+            approx_max_n_count = self.config.get('network',{}).get('node_count', 100) // 2 # 粗略估计
+            num_bins = self.neighbor_count_disc_bins
+            clipped_count = np.clip(count, 0, approx_max_n_count)
+            bin_width = approx_max_n_count / num_bins if num_bins > 0 else approx_max_n_count
+            if bin_width == 0: return 0 # 避免除零
+            return min(int(clipped_count / bin_width), num_bins - 1) 
 
     def discretize_ch_count_nearby(self, count):
-        # ... (如之前定义) ...
-        if count == 0: return 0 
-        elif count <= 2: return 1 
-        else: return 2  
+        return np.digitize(count, self.ch_count_disc_boundaries) 
 
     def discretize_normalized_distance_to_bs(self, normalized_distance):
-        # ... (如之前定义) ...
-        normalized_distance = np.clip(normalized_distance, 0, 1)
-        if normalized_distance < 0.25: return 0    
-        elif normalized_distance < 0.75: return 1  
-        else: return 2   
+        normalized_distance = np.clip(normalized_distance, 0, 1) # 确保在[0,1]
+        return np.digitize(normalized_distance, self.dist_bs_disc_boundaries) 
 
     def get_discrete_state_tuple_for_competition(self, node_id):
         # ... (实现，调用上面的离散化函数，返回一个元组) ..
@@ -320,7 +348,14 @@ class WSNEnv:
         comm_r = self.nodes[node_id]['base_communication_range']
         expected_neighbors_ref = avg_node_density_ref * np.pi * (comm_r**2)
         max_n_ref = max(15, int(expected_neighbors_ref * 2)) # 取一个上限
-
+        with open("raw_state_log.csv", "a") as f:
+            if f.tell() == 0: #写入表头
+                f.write("round,node_id,e_self_raw,t_last_ch_raw,n_neighbor_raw,e_neighbor_avg_raw,n_ch_nearby_raw,d_bs_normalized_raw\n")
+            f.write(f"{self.current_round},{node_id},"
+                    f"{raw_state['e_self']},{raw_state['t_last_ch']},"
+                    f"{raw_state['n_neighbor']},{raw_state['e_neighbor_avg']},"
+                    f"{raw_state['n_ch_nearby']},"
+                    f"{raw_state['d_bs'] / self.network_diagonal if self.network_diagonal > 0 else 0}\n")
 
         state_tuple = (
             self.discretize_normalized_energy(raw_state["e_self"]),
@@ -351,30 +386,34 @@ class WSNEnv:
         
         # 临时的邻居获取，效率不高，但能工作
         temp_neighbors_ids = []
-        if not hasattr(self, '_position_tree') or self._position_tree is None: # 确保索引存在
-            self._build_spatial_index()
 
-        if self._position_tree:
-            indices_in_kdtree = self._position_tree.query_ball_point(node["position"], node["current_communication_range"])
-            for kdtree_idx in indices_in_kdtree:
-                original_node_id = self.active_node_ids_for_kdtree[kdtree_idx]
-                if original_node_id != node_id:
-                     temp_neighbors_ids.append(original_node_id)
+        if self._position_tree: 
+            scan_radius_for_members = node["current_communication_range"] 
+            try:
+                # 明确指定参数 r
+                indices_in_kdtree = self._position_tree.query_ball_point(x=node["position"], r=scan_radius_for_members,p=2.0)
+                for kdtree_idx in indices_in_kdtree:
+                    original_node_id = self.active_node_ids_for_kdtree[kdtree_idx] 
+                    if original_node_id != node_id:
+                         temp_neighbors_ids.append(original_node_id)
+            except Exception as e_kdtree: # 捕获可能的KDTree查询错误
+                logger.error(f"KDTree query_ball_point 错误 for node {node_id} (pos {node['position']}, r {scan_radius_for_members}): {e_kdtree}", exc_info=True)
         
         n_neighbor = len(temp_neighbors_ids)
         e_neighbor_avg = 0
         if n_neighbor > 0:
             sum_neighbor_energy_normalized = sum(
                 (self.nodes[nid]["energy"] / self.nodes[nid]["initial_energy"] if self.nodes[nid]["initial_energy"] > 0 else 0)
-                for nid in temp_neighbors_ids if self.nodes[nid]["status"] == "active" # 确保邻居是活的
+                for nid in temp_neighbors_ids 
             )
             e_neighbor_avg = sum_neighbor_energy_normalized / n_neighbor if n_neighbor > 0 else 0 #再次检查n_neighbor
         
         n_ch_nearby = 0
         # 使用 confirmed_cluster_heads_previous_round
-        for ch_id_prev in self.confirmed_cluster_heads_previous_round: 
-            if ch_id_prev != node_id and self.nodes[ch_id_prev]["status"] == "active":
-                if self.calculate_distance(node_id, ch_id_prev) <= node["current_communication_range"] * 1.5:
+        scan_radius_for_chs = node["current_communication_range"] * 1.5
+        for ch_id_prev in self.confirmed_cluster_heads_previous_epoch: 
+            if ch_id_prev != node_id and self.nodes[ch_id_prev]["status"] == "active": # 确保参考的旧CH还是活的
+                if self.calculate_distance(node_id, ch_id_prev) <= scan_radius_for_chs:
                     n_ch_nearby += 1
         
         d_bs = self.calculate_distance_to_bs(node_id)
@@ -583,6 +622,9 @@ class WSNEnv:
             # 简单处理：如果太少，就用初步筛选后、距离去重前的列表，再限制数量
             logger.warning(f"距离筛选后CH ({len(final_refined_candidates)}) 过少，尝试从能量筛选结果补充。")
             temp_recheck = preliminary_candidates[:max_total_chs_target] # 取能量高的
+            comm_range_avg = self.config.get('network', {}).get('communication_range', 100.0)
+            min_ch_dist_factor = self.config.get('deec', {}).get('ch_finalize_too_close_factor', 0.7) # 使用 finalize 的因子
+            d_min_ch_dist = min_ch_dist_factor * comm_range_avg
             # 再次进行简化距离筛选
             final_refined_candidates = []
             for cand_id in temp_recheck:
@@ -1013,6 +1055,7 @@ class WSNEnv:
         logger.info(f"--- 开始第 {self.current_round} 轮  ---")
 
         # 0. 更新和准备工作
+        self._build_spatial_index()
         self.confirmed_cluster_heads_current_round = []
         self.identify_direct_bs_nodes()
         for node_data_loop in self.nodes: # 使用不同的变量名
@@ -1084,6 +1127,26 @@ class WSNEnv:
                 }
                 if action_to_take == 1:
                     ch_declarations_this_epoch.append(node_id_compete)
+                raw_state_values_for_log = self.get_node_state_for_ch_competition(node_id_compete) # 获取原始状态
+                if raw_state_values_for_log: # 确保获取成功
+                    # 将原始状态（绝对值）也存起来用于日志
+                    self.competition_log_for_current_epoch[node_id_compete] = {
+                        "state_tuple": state_tuple_compete, 
+                        "action": action_to_take,
+                        "raw_state_for_log": { # 存储日志需要的原始值
+                            "e_self_abs": self.nodes[node_id_compete]["energy"], # 记录当前绝对能量
+                            "t_last_ch": raw_state_values_for_log["t_last_ch"],
+                            "n_neighbor": raw_state_values_for_log["n_neighbor"],
+                            "d_bs_abs": raw_state_values_for_log["d_bs"] # 记录原始距离
+                            # 可以根据需要添加其他原始值
+                        }
+                    }
+                else: # raw_state_values_for_log is None (节点可能状态不对)
+                    self.competition_log_for_current_epoch[node_id_compete] = {
+                        "state_tuple": state_tuple_compete, 
+                        "action": action_to_take,
+                        "raw_state_for_log": {} # 存一个空字典避免后续get失败
+                    }
             
             logger.info(f"Epoch CH竞争：{len(ch_declarations_this_epoch)} 个节点宣告想成为CH: {ch_declarations_this_epoch}")
 
@@ -1312,10 +1375,25 @@ class WSNEnv:
                 # 假设CH至少有自己的数据要发送，或者根据成员数量判断是否有数据
                 # has_data = True # 简化：假设总有数据
                 # if not has_data: continue
-                ch_node_data["current_data_path"] = [ch_id]
+                if not ch_node_data.get("current_data_path") or ch_node_data.get("source_ch_of_current_packet", -1) == -1: # 或者检查 source_ch_of_current_packet == -1
+                    ch_node_data["current_data_path"] = [ch_id]
+                    ch_node_data["source_ch_of_current_packet"] = ch_id
+                    ch_node_data["gen_round_of_current_packet"] = self.current_round
+                    logger.debug(f"CH {ch_id} 作为源头/开始新数据流，产生融合包于轮次 {self.current_round}. Path: {ch_node_data['current_data_path']}")
+
                 current_path_history = list(ch_node_data["current_data_path"]) # 使用副本进行决策
+                # 确保当前CH的ID在路径的末尾（如果它是被传递过来的，上游应该已经加了）
+                if not current_path_history or current_path_history[-1] != ch_id:
+                    # 这种情况理论上不应该发生，如果路径传递正确的话
+                    # 但作为防御，如果路径为空或末尾不是自己，则重置为源头
+                    logger.warning(f"CH {ch_id}: current_data_path ({current_path_history}) 状态异常，重置为源头路径。")
+                    ch_node_data["current_data_path"] = [ch_id]
+                    ch_node_data["source_ch_of_current_packet"] = ch_id # 源信息也应重置
+                    ch_node_data["gen_round_of_current_packet"] = self.current_round
+                    current_path_history = list(ch_node_data["current_data_path"])
+
                 # --- 调试日志：打印当前CH信息 ---
-                logger.info(f"[CH_DECISION_TRACE] CH {ch_id} (Energy: {ch_node_data['energy']:.4f}) 开始决策...")
+                #logger.info(f"[CH_DECISION_TRACE] CH {ch_id} (Energy: {ch_node_data['energy']:.4f}) 开始决策...")
 
                 #logger.debug(f"CH {ch_id} 开始决策，当前数据路径历史: {current_path_history}")
                 # --- 动态通信范围调整循环 (来自你之前的方案) ---
@@ -1368,21 +1446,23 @@ class WSNEnv:
                         candidate_next_hops_info_all_ranges.extend(current_attempt_candidates_info)
                         # 策略1: 找到就用当前范围的候选者 (如果你想这样，这里就 break)
                         # break 
-                
-                if len(current_path_history) > 10:
-                    logger.warning(f"CH {ch_id} 数据包路径 {current_path_history} 已超最大跳数 {10}。丢弃数据包。")
-                    # 相应处理，例如给负奖励，不进行传输
-                    ch_node_data["chosen_next_hop_id"] = None # 阻止发送
-                    continue
+                max_hops_config = self.config.get("simulation", {}).get("max_packet_hops", 15)
+                if len(current_path_history) > max_hops_config:
+                    logger.warning(f"CH {ch_id}: 数据包路径 {current_path_history} (源CH: {ch_node_data.get('source_ch_of_current_packet')}) 已超最大跳数 {max_hops_config}。丢弃。")
+                    ch_node_data["chosen_next_hop_id"] = None 
+                    ch_node_data["current_data_path"] = [] # 清空路径，表示此包处理结束（丢弃）
+                    ch_node_data["source_ch_of_current_packet"] = -1 
+                    ch_node_data["gen_round_of_current_packet"] = -1
+                    continue # 处理下一个CH
                 
                 # --- Q学习决策 (基于所有尝试范围找到的候选者) ---
                 final_candidates_to_evaluate_info = []
                 if candidate_next_hops_info_all_ranges:
-                    temp_dict_nh = {}
+                    temp_dict_nh = {} # key: nh_id, value: (nh_id, type, distance)
                     for nh_id_eval, nh_type_eval, nh_dist_eval in candidate_next_hops_info_all_ranges:
-                        if nh_id_eval not in temp_dict_nh or nh_dist_eval < temp_dict_nh[nh_id_eval][2]: # index 2 for distance
-                            temp_dict_nh[nh_id_eval] = (nh_id_eval, nh_type_eval, nh_dist_eval) # Store all three
-                    final_candidates_to_evaluate_info = list(temp_dict_nh.values()) # List of tuples (id, type, dist)
+                        if nh_id_eval not in temp_dict_nh or nh_dist_eval < temp_dict_nh[nh_id_eval][2]: # 比较元组中第3个元素（距离）
+                            temp_dict_nh[nh_id_eval] = (nh_id_eval, nh_type_eval, nh_dist_eval)
+                    final_candidates_to_evaluate_info = list(temp_dict_nh.values())
 
                 if final_candidates_to_evaluate_info:
                     candidate_ids_types = [(info[0], info[1]) for info in final_candidates_to_evaluate_info]
@@ -1400,23 +1480,23 @@ class WSNEnv:
         
                 # 2. 过滤候选下一跳，排除已在路径历史中的节点
                 valid_next_hops_q_values = {}
-                logger.info(f"[CH_DECISION_TRACE] CH {ch_id} 评估有效候选 (Path: {current_path_history}):")
+                #logger.info(f"[CH_DECISION_TRACE] CH {ch_id} 评估有效候选 (Path: {current_path_history}):")
                 for nh_id_cand, nh_type_cand, dist_cand in final_candidates_to_evaluate_info:
                     if nh_id_cand == bs_id_for_routing: # BS总是有效目标
                         valid_next_hops_q_values[nh_id_cand] = self.get_q_value_select_next_hop(ch_id, nh_id_cand)
-                        is_valid_due_to_path = True
+                        #is_valid_due_to_path = True
                         # logger.info(f"[CH_DECISION_TRACE]   - Cand: {nh_id_cand} (Type: {nh_type_cand}), Q_val: {q_val_for_cand:.3f} (BS, always valid path-wise)")
                     elif nh_id_cand not in current_path_history: # 如果不在路径中，则是有效候选
                             valid_next_hops_q_values[nh_id_cand] = self.get_q_value_select_next_hop(ch_id, nh_id_cand)
-                            is_valid_due_to_path = True
+                            #is_valid_due_to_path = True
                             # logger.info(f"[CH_DECISION_TRACE]   - Cand: {nh_id_cand} (Type: {nh_type_cand}), Q_val: {q_val_for_cand:.3f} (Not in path, valid)")
                     else:
                         logger.debug(f"CH {ch_id} 排除候选下一跳 {nh_id_cand}，因为它已在路径 {current_path_history} 中。")
                         # 可以选择给一个极低的Q值，或者干脆不加入valid_next_hops_q_values
                     
-                    logger.info(f"[CH_DECISION_TRACE] CH {ch_id} 最终有效候选及Q值: {valid_next_hops_q_values}")
-
-                if valid_next_hops_q_values: # 先确保非空
+                    #logger.info(f"[CH_DECISION_TRACE] CH {ch_id} 最终有效候选及Q值: {valid_next_hops_q_values}")
+                
+                if valid_next_hops_q_values: # 先确保非空                    
                     if random.random() < current_epsilon_ch_hop:
                         chosen_next_hop_id_for_ch = random.choice(list(valid_next_hops_q_values.keys()))
                     else:
@@ -1425,18 +1505,23 @@ class WSNEnv:
                         for q_val_check in valid_next_hops_q_values.values():
                             if q_val_check > max_q:
                                 max_q = q_val_check
-                        
-                        # 找到所有Q值等于最大Q值的候选
-                        tied_best_hops = [nh_id for nh_id, q_v in valid_next_hops_q_values.items() if abs(q_v - max_q) < 1e-9] # 用精度比较浮点数
-
-                        if tied_best_hops:
-                            chosen_next_hop_id_for_ch = random.choice(tied_best_hops)
-                            best_q_val_nh_log = valid_next_hops_q_values[chosen_next_hop_id_for_ch] # 用于日志
-                            logger.debug(f"CH {ch_id} (Select NH) 利用选择了有效下一跳 {chosen_next_hop_id_for_ch} (Q={best_q_val_nh_log:.2f}) 从 {len(tied_best_hops)} 个并列最优中选择。")
+                        if max_q == -float('inf'): # 所有选项都极差
+                            logger.warning(f"CH {ch_id}: 所有有效下一跳的Q值都是-inf或无效: {valid_next_hops_q_values}")
+                            # 随机选一个，或者标记为失败
+                            # chosen_next_hop_id_for_ch = random.choice(list(valid_next_hops_q_values.keys())) # 即使是-inf也选一个
+                            chosen_next_hop_id_for_ch = -100 # 或者标记为无法选择
                         else:
-                            # 这个分支理论上不应该被执行，如果 valid_next_hops_q_values 非空
-                            logger.error(f"CH {ch_id} 在利用分支中，valid_next_hops_q_values非空但tied_best_hops为空! Q_values: {valid_next_hops_q_values}")
-                            chosen_next_hop_id_for_ch = -100 
+                        # 找到所有Q值等于最大Q值的候选
+                            tied_best_hops = [nh_id for nh_id, q_v in valid_next_hops_q_values.items() if abs(q_v - max_q) < 1e-9] # 用精度比较浮点数
+
+                            if tied_best_hops:
+                                chosen_next_hop_id_for_ch = random.choice(tied_best_hops)
+                                best_q_val_nh_log = valid_next_hops_q_values[chosen_next_hop_id_for_ch] # 用于日志
+                                logger.debug(f"CH {ch_id} (Select NH) 利用选择了有效下一跳 {chosen_next_hop_id_for_ch} (Q={best_q_val_nh_log:.2f}) 从 {len(tied_best_hops)} 个并列最优中选择。")
+                            else:
+                                # 这个分支理论上不应该被执行，如果 valid_next_hops_q_values 非空
+                                logger.error(f"CH {ch_id} 在利用分支中，valid_next_hops_q_values非空但tied_best_hops为空! Q_values: {valid_next_hops_q_values}")
+                                chosen_next_hop_id_for_ch = -100 
                 else: # valid_next_hops_q_values 为空
                     logger.warning(f"CH {ch_id} 没有有效的（非环路）下一跳可选...")
                     chosen_next_hop_id_for_ch = -100 # 或者 None
@@ -1448,13 +1533,13 @@ class WSNEnv:
                 
                 
                 # --- 动作执行与Q表更新 ---
-                logger.info(f"[FINAL_CHOICE_DEBUG] CH {ch_id}: Epsilon-Greedy后，最终 chosen_next_hop_id_for_ch = {chosen_next_hop_id_for_ch}, 类型: {type(chosen_next_hop_id_for_ch)}")
+                #logger.info(f"[FINAL_CHOICE_DEBUG] CH {ch_id}: Epsilon-Greedy后，最终 chosen_next_hop_id_for_ch = {chosen_next_hop_id_for_ch}, 类型: {type(chosen_next_hop_id_for_ch)}")
                 if chosen_next_hop_id_for_ch != -100 and chosen_next_hop_id_for_ch is not None:
-                    logger.info(f"[FINAL_CHOICE_DEBUG] CH {ch_id}: 进入了成功选择的IF块，chosen_next_hop_id_for_ch = {chosen_next_hop_id_for_ch}")
+                    #logger.info(f"[FINAL_CHOICE_DEBUG] CH {ch_id}: 进入了成功选择的IF块，chosen_next_hop_id_for_ch = {chosen_next_hop_id_for_ch}")
                     try: # <<< --- 整体 try 块开始 ---
                         action_taken_ch_hop = chosen_next_hop_id_for_ch
                         ch_node_data["chosen_next_hop_id"] = chosen_next_hop_id_for_ch # 记录选择
-                        logger.debug(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: 动作已记录 chosen_next_hop_id = {ch_node_data['chosen_next_hop_id']}")
+                        #logger.debug(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: 动作已记录 chosen_next_hop_id = {ch_node_data['chosen_next_hop_id']}")
 
                         chosen_nh_info = next((info for info in final_candidates_to_evaluate_info if info[0] == chosen_next_hop_id_for_ch), None)
                         if not chosen_nh_info:
@@ -1482,11 +1567,11 @@ class WSNEnv:
                             is_bs_valid_pathwise_debug = bs_cand_id_debug in valid_next_hops_q_values
                             q_val_for_bs_debug = valid_next_hops_q_values.get(bs_cand_id_debug, "N/A")
                             
-                            logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: BS ({bs_cand_id_debug}) 是候选。路径有效性: {is_bs_valid_pathwise_debug}。Q(CH,BS): {q_val_for_bs_debug}")
-                            if chosen_next_hop_id_for_ch == bs_cand_id_debug: # 即 next_hop_is_bs_flag 为 True
-                                logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: *** 选择了BS ({bs_cand_id_debug}) ***")
-                            elif is_bs_valid_pathwise_debug : 
-                                logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: BS ({bs_cand_id_debug}) 是有效候选但未被选择。最终选择: {chosen_next_hop_id_for_ch} (Type: {chosen_nh_type})")
+                            #logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: BS ({bs_cand_id_debug}) 是候选。路径有效性: {is_bs_valid_pathwise_debug}。Q(CH,BS): {q_val_for_bs_debug}")
+                            #if chosen_next_hop_id_for_ch == bs_cand_id_debug: # 即 next_hop_is_bs_flag 为 True
+                            #    logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: *** 选择了BS ({bs_cand_id_debug}) ***")
+                            #elif is_bs_valid_pathwise_debug : 
+                            #    logger.info(f"[BS_CHOICE_DEBUG] CH {ch_id}: BS ({bs_cand_id_debug}) 是有效候选但未被选择。最终选择: {chosen_next_hop_id_for_ch} (Type: {chosen_nh_type})")
 
 
                         next_hop_node_obj = None 
@@ -1495,7 +1580,7 @@ class WSNEnv:
                             if not next_hop_node_obj: # 以防万一
                                 logger.error(f"[CRITICAL_ERROR] CH {ch_id}: next_hop_node_obj 为 None，但下一跳ID为 {chosen_next_hop_id_for_ch} 且不是BS。")
                                 raise ValueError("Failed to get next_hop_node_obj")
-                        logger.debug(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: next_hop_node_obj is {'None' if not next_hop_node_obj else next_hop_node_obj['id']}")
+                        #logger.debug(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: next_hop_node_obj is {'None' if not next_hop_node_obj else next_hop_node_obj['id']}")
 
 
                         # 1. 收集模糊输入
@@ -1598,49 +1683,83 @@ class WSNEnv:
                         )
                         logger.debug(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: Q-table updated for action to {action_taken_ch_hop}")
 
-                        # 8. 能量消耗
-                        logger.debug(f"[ENERGY_TRACE] CH {ch_id}: Attempting to consume TX energy {actual_e_tx_to_nh_val:.4e}")
-                        if self.consume_node_energy(ch_id, actual_e_tx_to_nh_val):
-                            ch_node_data["tx_count"] += 1
-                            logger.debug(f"[ENERGY_TRACE] CH {ch_id}: TX energy consumed. Remaining: {ch_node_data['energy']:.4f}")
-                        else:
-                            logger.warning(f"[ENERGY_TRACE] CH {ch_id}: Died after TX energy consumption.")
-                            # 如果节点死亡，可能不应再进行路径传递等操作，但Q值已更新
-
-                        if transmission_success_ch_hop_flag and not next_hop_is_bs_flag and next_hop_node_obj and next_hop_node_obj["status"] == "active": # 确保下一跳也活着
-                            energy_rx_next_hop_val = self.calculate_transmission_energy(0, packet_size_for_ch_val, is_tx_operation=False) # Renamed variable
-                            logger.debug(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: Attempting to consume RX energy {energy_rx_next_hop_val:.4e}")
-                            if self.consume_node_energy(chosen_next_hop_id_for_ch, energy_rx_next_hop_val):
-                                next_hop_node_obj["rx_count"] +=1 
-                                logger.debug(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: RX energy consumed. Remaining: {next_hop_node_obj['energy']:.4f}")
+                        if transmission_success_ch_hop_flag:
+                            # 8. 能量消耗
+                            logger.debug(f"[ENERGY_TRACE] CH {ch_id}: Attempting to consume TX energy {actual_e_tx_to_nh_val:.4e}")
+                            if self.consume_node_energy(ch_id, actual_e_tx_to_nh_val):
+                                ch_node_data["tx_count"] += 1
+                                logger.debug(f"[ENERGY_TRACE] CH {ch_id}: TX energy consumed. Remaining: {ch_node_data['energy']:.4f}")
                             else:
-                                logger.warning(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: Died after RX energy consumption.")
+                                logger.warning(f"[ENERGY_TRACE] CH {ch_id}: Died after TX energy consumption.")
+                                # 如果节点死亡，可能不应再进行路径传递等操作，但Q值已更新
+
+                            if transmission_success_ch_hop_flag and not next_hop_is_bs_flag and next_hop_node_obj and next_hop_node_obj["status"] == "active": # 确保下一跳也活着
+                                energy_rx_next_hop_val = self.calculate_transmission_energy(0, packet_size_for_ch_val, is_tx_operation=False) # Renamed variable
+                                logger.debug(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: Attempting to consume RX energy {energy_rx_next_hop_val:.4e}")
+                                if self.consume_node_energy(chosen_next_hop_id_for_ch, energy_rx_next_hop_val):
+                                    next_hop_node_obj["rx_count"] +=1 
+                                    logger.debug(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: RX energy consumed. Remaining: {next_hop_node_obj['energy']:.4f}")
+                                else:
+                                    logger.warning(f"[ENERGY_TRACE] NH {chosen_next_hop_id_for_ch}: Died after RX energy consumption.")
                         
                         # 路径传递逻辑 (只为下一跳是CH的情况更新其current_data_path)
-                        if transmission_success_ch_hop_flag:
-                            if chosen_nh_type == "CH" and next_hop_node_obj and next_hop_node_obj["status"] == "active":
+                       # b. 数据包送达BS的统计 和 时延计算 (只在这里做一次)
+                            is_logically_at_bs = (next_hop_is_bs_flag or chosen_next_hop_is_direct_bs_node_flag)
+                            if is_logically_at_bs:
+                                self.sim_packets_delivered_bs_this_round += 1
+                                self.sim_packets_delivered_bs_total += 1
+                                logger.debug(f"CH {ch_id} (Path: {current_path_history}) 将融合包送达BS逻辑入口 (NH: {chosen_next_hop_id_for_ch})")
+
+                                original_gen_round = ch_node_data.get("gen_round_of_current_packet", -1)
+                                original_source_ch = ch_node_data.get("source_ch_of_current_packet", -1)
+                                if original_gen_round != -1:
+                                    delay = self.current_round - original_gen_round + 1
+                                    self.sim_total_delay_this_round += delay
+                                    self.sim_num_packets_for_delay_this_round += 1
+                                    logger.debug(f"  Fusion packet (SourceCH: {original_source_ch}, GenRound: {original_gen_round}) delay: {delay} rounds")
+                                else:
+                                    logger.warning(f"  CH {ch_id} delivered fusion packet to BS-like target, but missing original_gen_round info!")
+                                
+                                # 清理当前CH的这个数据流信息
+                                ch_node_data["current_data_path"] = [] 
+                                ch_node_data["source_ch_of_current_packet"] = -1 
+                                ch_node_data["gen_round_of_current_packet"] = -1
+                            
+                            # c. 路径传递给下一跳CH (如果下一跳是CH且未到逻辑BS)
+                            elif chosen_nh_type == "CH" and next_hop_node_obj and next_hop_node_obj["status"] == "active": # 确保不是逻辑BS
                                 path_passed_on = list(current_path_history) 
                                 if next_hop_node_obj["id"] not in path_passed_on:
                                     path_passed_on.append(next_hop_node_obj["id"])
-                                else:
-                                    logger.error(f"[PATH_ERROR] CH {ch_id}: Next hop CH {next_hop_node_obj['id']} is already in path {path_passed_on} being passed!") # This is a serious error if it happens
+                                else: # Should not happen due to earlier filtering
+                                    logger.error(f"[PATH_ERROR_CRITICAL] CH {ch_id}: Next hop CH {next_hop_node_obj['id']} is ALREADY in path {path_passed_on}!")
                                 
-                                # 最大跳数检查
                                 max_hops_config = self.config.get("simulation", {}).get("max_packet_hops", 15)
                                 if len(path_passed_on) > max_hops_config:
-                                    logger.warning(f"[PATH_LIMIT_EXCEEDED] CH {ch_id}: Path {path_passed_on} for NH {next_hop_node_obj['id']} exceeds max hops {max_hops_config}. Path not passed.")
+                                    logger.warning(f"[PATH_LIMIT_EXCEEDED] CH {ch_id}: Path {path_passed_on} for NH {next_hop_node_obj['id']} exceeds max hops {max_hops_config}. Path not passed, data effectively dropped here.")
+                                    # 可以在这里给一个额外的负奖励信号，或者依赖传输失败的奖励
+                                    # 如果TTL超限，逻辑上这个包不应该被下一跳接收并继续处理其路径
+                                    ch_node_data["current_data_path"] = [] 
+                                    ch_node_data["source_ch_of_current_packet"] = -1 
+                                    ch_node_data["gen_round_of_current_packet"] = -1
                                 else:
                                     next_hop_node_obj["current_data_path"] = path_passed_on
-                                    logger.debug(f"[PATH_PASS_TRACE] CH {ch_id} -> CH {next_hop_node_obj['id']}. Path for next hop updated to: {path_passed_on}")
-                            
-                            elif next_hop_is_bs_flag or chosen_next_hop_is_direct_bs_node_flag : # 数据到达BS或通过直连节点
-                                logger.debug(f"[PATH_END_TRACE] CH {ch_id}: Data reached BS or Direct BS Node {chosen_next_hop_id_for_ch}. Path {current_path_history} ends.")
-                                ch_node_data["current_data_path"] = [] # 清空当前CH的路径，表示这个数据单元处理完毕
+                                    next_hop_node_obj["source_ch_of_current_packet"] = ch_node_data["source_ch_of_current_packet"]
+                                    next_hop_node_obj["gen_round_of_current_packet"] = ch_node_data["gen_round_of_current_packet"]
+                                    logger.debug(f"[PATH_PASS_TRACE] CH {ch_id} -> CH {next_hop_node_obj['id']}. Path for next hop: {path_passed_on}, SourceInfo: SrcCH={ch_node_data['source_ch_of_current_packet']}, GenRnd={ch_node_data['gen_round_of_current_packet']}")
+                                    
+                                    # 成功传递给下一个CH后，清空当前CH的这个数据流状态
+                                    ch_node_data["current_data_path"] = [] 
+                                    ch_node_data["source_ch_of_current_packet"] = -1 
+                                    ch_node_data["gen_round_of_current_packet"] = -1
                         
-                        logger.info(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: Successfully processed choice for NH {chosen_next_hop_id_for_ch}. END of try block.")
+                        else: # transmission_success_ch_hop_flag is False
+                            logger.warning(f"[TRANSMISSION_FAIL] CH {ch_id} -> NH {chosen_next_hop_id_for_ch} (Type: {chosen_nh_type}). Data not passed.")
+                            # 数据未成功发送，路径和源信息不传递，当前CH的current_data_path等信息保留，可能会在下一轮重试（如果它还是CH）
+                            
+                        #logger.info(f"[SUCCESS_BLOCK_TRACE] CH {ch_id}: Successfully processed choice for NH {chosen_next_hop_id_for_ch}. END of try block.")
 
                     except Exception as e_inner:
-                        logger.error(f"[CRITICAL_ERROR_IN_IF_BLOCK] CH {ch_id} 在处理选定下一跳 {chosen_next_hop_id_for_ch} (Type: {chosen_nh_type if 'chosen_nh_type' in locals() else 'UNKNOWN'}) 时发生内部错误: {e_inner}", exc_info=True)
+                        logger.error(f"[CRITICAL_ERROR_IN_IF_BLOCK] CH {ch_id} 在处理选定下一跳 {chosen_next_hop_id_for_ch}  时发生内部错误: {e_inner}", exc_info=True)
                         ch_node_data["chosen_next_hop_id"] = None # 发生错误，标记为未选择
                         # chosen_next_hop_id_for_ch = -100 # 确保后续的else会捕获这个状态 (如果需要)
 
@@ -1683,8 +1802,35 @@ class WSNEnv:
         # 注意：这里的能耗应该是与Q学习决策和数据传输分离的背景能耗
         # 或者，如果你的Q学习奖励已经完全包含了所有能耗，这里就不需要再减了
         # 我之前的 simulate_round_energy_consumption 包含了通信，需要调整
-        self.simulate_base_round_energy_consumption() # 假设有一个只处理背景能耗的函数
+        self.simulate_base_round_energy_consumption() # 
+                
+        alive_nodes_list = [n for n in self.nodes if n["status"] == "active"]
+        num_alive = len(alive_nodes_list)
+        total_energy_now = sum(n["energy"] for n in alive_nodes_list)
+        avg_energy_now = total_energy_now / num_alive if num_alive > 0 else 0
         
+        active_chs_list = [self.nodes[ch_id_rec] for ch_id_rec in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id_rec]["status"] == "active"] # 使用本epoch确认的CH
+        num_ch_now = len(active_chs_list)
+        avg_ch_energy_now = sum(n["energy"] for n in active_chs_list) / num_ch_now if num_ch_now > 0 else 0
+        
+        members_counts = []
+        if num_ch_now > 0:
+            for ch_node_rec in active_chs_list:
+                members_counts.append(len([m_node for m_node in alive_nodes_list if m_node.get("cluster_id") == ch_node_rec["id"]]))
+        avg_members_now = sum(members_counts) / num_ch_now if num_ch_now > 0 else 0
+        ch_load_variance_now = np.var(members_counts) if members_counts else 0
+
+        self.sim_total_delay_this_round = 0.0
+        self.sim_num_packets_for_delay_this_round = 0
+        # 假设你有一些变量记录数据包信息 (需要你在仿真中实现这些统计)
+        packets_generated_this_round = getattr(self, 'sim_packets_generated', 0) # 从env属性获取
+        packets_to_bs_this_round = getattr(self, 'sim_packets_delivered_bs', 0)
+        avg_delay_this_round = getattr(self, 'sim_avg_delay', 0)
+
+        with open(PROJECT_ROOT / "reports" / "performance_log.csv", "a", encoding="utf-8") as f_perf:
+            f_perf.write(f"{self.current_round},{num_alive},{total_energy_now:.4f},{avg_energy_now:.4f},"
+                        f"{num_ch_now},{avg_ch_energy_now:.4f},{avg_members_now:.2f},{ch_load_variance_now:.2f},"
+                        f"{packets_generated_this_round},{packets_to_bs_this_round},{avg_delay_this_round:.4f}\n")
         logger.info(f"--- 第 {self.current_round} 轮结束 ---")
         # ... (日志和返回)
         return True
@@ -1844,6 +1990,7 @@ class WSNEnv:
     def handle_isolated_nodes(self):
         """处理孤立节点，尝试增加通信范围或调整p_opt"""
         max_attempts = 3 # 最多尝试增加通信范围的次数
+        isolated_count = 0
         for attempt in range(1, max_attempts + 1):
             isolated_count = self.assign_nodes_to_clusters(attempt=attempt)
             if isolated_count == 0:
@@ -2039,7 +2186,12 @@ class WSNEnv:
         if not active_node_positions:
             self._position_tree = None
             return
-        self._position_tree = KDTree(active_node_positions)
+        try:
+            self._position_tree = KDTree(active_node_positions)
+        # logger.debug(f"空间索引构建/更新完毕，包含 {len(active_node_positions)} 个活跃节点。")
+        except Exception as e:
+            logger.error(f"构建KDTree时发生错误: {e}", exc_info=True)
+            self._position_tree = None
         
     def get_node_neighbors(self, node_id, max_distance=None):
         if not (0 <= node_id < len(self.nodes)):
@@ -2056,10 +2208,14 @@ class WSNEnv:
         node = self.nodes[node_id]
         if node["status"] == "dead": return []
 
-        max_dist = max_distance if max_distance is not None else node["communication_range"]
+        max_dist_query = max_distance if max_distance is not None else node["current_communication_range"] # 使用 current_communication_range
         
-        # KDTree查询返回的是在 active_node_positions 列表中的索引
-        indices_in_kdtree = self._position_tree.query_ball_point(node["position"], max_dist)
+        indices_in_kdtree = [] # 初始化
+        try:
+            # 明确指定参数 r
+            indices_in_kdtree = self._position_tree.query_ball_point(x=node["position"], r=max_dist_query,p=2.0)
+        except Exception as e_kdtree_neighbors:
+            logger.error(f"KDTree query_ball_point 错误 in get_node_neighbors for node {node_id} (pos {node['position']}, r {max_dist_query}): {e_kdtree_neighbors}", exc_info=True)
         
         # 将KDTree索引映射回原始节点ID
         neighbor_ids = []

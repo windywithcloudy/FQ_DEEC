@@ -1,1 +1,7 @@
 vs_py/Q_DEEC/reports/*
+vs_py/Q_DEEC/src/main.py
+raw_state_log.csv
+vs_py/Q_DEEC/simulation.log
+vs_py/Q_DEEC/simulation.log.1
+vs_py/Q_DEEC/simulation.log.2
+vs_py/Q_DEEC/simulation.log.3
