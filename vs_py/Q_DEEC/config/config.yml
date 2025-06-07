@@ -26,10 +26,11 @@ energy:
   idle_listening_per_round: 0.000001 # 假设的空闲监听消耗 (J/round)
   sensing_per_round: 0.0000005       # 假设的感知消耗 (J/round)
   min_energy_direct_bs: 0.1 # 节点直连BS所需的最小能量比例 (相对于初始能量)
+  fusion_efficiency_factor: 0.1  # 数据融合效率因子。0表示完美融合（大小不变），1表示无压缩（大小=N*基础大小）。
   
 # 仿真控制
 simulation:
-  total_rounds: 2000      # 总仿真轮数
+  total_rounds: 5000      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
   max_packet_hops: 10       #最大跳数
@@ -69,6 +70,13 @@ deec:
   ch_communication_range_max: 200  # CH允许的最大通信范围 (m)
   ch_communication_range_steps: 4
   ch_communication_range_increment: 25
+  ch_finalize_rules:
+    min_count_factor: 0.8  # 最小CH数量 = 理想值 * 0.8
+    max_count_factor: 1.2  # 最大CH数量 = 理想值 * 1.2
+    too_close_factor: 0.8  # CH间最小距离 = 通信范围 * 0.8
+    coverage_weight: 0.5
+    energy_weight: 0.3
+    centrality_weight: 0.2
   # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
   # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
                            # 对于初步集成，我们可以简化为每轮都可能重新选举
@@ -109,6 +117,14 @@ q_learning:
   ch_switching_hysteresis: 5.0 # 新增：普通节点切换CH的Q值滞后阈值 (奖励单位)
   alpha_ch_hop: 0.1
   gamma_ch_hop: 0.9
+  geography_reward_factor: 0.05
+  ch_buffer_size: 20
+  q_value_factor: 1.0              # 历史Q值的权重
+  geography_reward_factor: 0.05    # 地理进展奖励的权重
+  shortest_path_reward_factor: 10.0 # 全局最短路径奖励的权重
+  ch_management: # 或者放在 deec: 下
+    enable_capacity_limit: true       # 是否启用CH容量限制
+    max_members_factor: 1.5           # CH最大成员数 = (网络平均每CH成员数) * max_members_factor
   # 可以为普通节点选择CH的Q学习也添加类似参数
 
 rewards:
@@ -139,6 +155,9 @@ rewards:
     next_hop_low_energy_penalty_unit: -20
     next_hop_high_load_penalty_unit: -15
     reach_bs_via_direct_node_bonus: 10 # 新增：通过直连节点到达BS的奖励
+
+  select_ch:
+    rejection_penalty: -30.0        # 当选择的CH因容量满而拒绝加入时的惩罚
 
 discretization_params:
   energy: # 归一化能量

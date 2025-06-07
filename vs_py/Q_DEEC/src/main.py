@@ -102,6 +102,9 @@ def main():
                 )
         
         logger.info("DEEC分簇仿真演示完成。")
+        overall_pdr = environment.sim_packets_delivered_bs_total / environment.sim_packets_generated_total if environment.sim_packets_generated_total > 0 else 0
+        logger.info(f"仿真结束。总生成数据包: {environment.sim_packets_generated_total}, 总送达数据包: {environment.sim_packets_delivered_bs_total}")
+        logger.info(f"最终全局数据包投递率 (Overall PDR): {overall_pdr:.4f}")
         
         # --- 在这里可以继续您的其他仿真逻辑 ---
         # 例如:

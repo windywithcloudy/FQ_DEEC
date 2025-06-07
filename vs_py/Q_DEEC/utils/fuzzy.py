@@ -553,56 +553,75 @@ class RewardWeightsFuzzySystemForCHCompetition:
             out_var['Increase'] = fuzz.smf(out_var.universe, 1.1, 1.3)
         logger.debug("Antecedents and consequents defined.")
 
+    # in fuzzy.py -> class RewardWeightsFuzzySystemForCHCompetition
+
+    # in fuzzy.py -> class RewardWeightsFuzzySystemForCHCompetition
+
     def _define_rules_once(self):
-        logger.debug("Defining fuzzy rules for RewardWeightsFuzzySystem...")
+        """
+        定义一套修正后的、全覆盖的模糊规则。
+        """
+        logger.debug("Defining a new, robust, full-coverage set of fuzzy rules for RewardWeightsFuzzySystem...")
         rules = []
-        # 调整 w_members_factor
-        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_members_factor['Increase']))
-        rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_members_factor['Neutral']))
+
+        # ======================================================================
+        # 规则集 1: w_members_factor (成员收益权重)
+        # 主要由全局CH密度决定。
+        # ======================================================================
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'],  self.w_members_factor['Increase']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'],  self.w_members_factor['Neutral']))
         rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_members_factor['Decrease']))
 
-        # 调整 w_energy_self_factor
-        rules.append(ctrl.Rule(self.network_energy_level['Low'] & self.node_self_energy['High'], self.w_energy_self_factor['Increase']))
-        rules.append(ctrl.Rule(self.network_energy_level['Medium'] & self.node_self_energy['High'], self.w_energy_self_factor['Increase']))
-        rules.append(ctrl.Rule(self.network_energy_level['Low'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Increase']))
-        rules.append(ctrl.Rule(self.network_energy_level['High'] & self.node_self_energy['High'], self.w_energy_self_factor['Neutral']))
-        rules.append(ctrl.Rule(self.network_energy_level['Medium'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Neutral']))
-        rules.append(ctrl.Rule(self.network_energy_level['High'] & self.node_self_energy['Medium'], self.w_energy_self_factor['Decrease']))
-        rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_energy_self_factor['Decrease']))
-        
-        # 调整 w_cost_ch_factor
+        # ======================================================================
+        # 规则集 2: w_cost_ch_factor (成为CH的成本权重)
+        # 主要由全局CH密度决定。
+        # ======================================================================
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'],  self.w_cost_ch_factor['Decrease']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'],  self.w_cost_ch_factor['Neutral']))
         rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_cost_ch_factor['Increase']))
-        rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_cost_ch_factor['Neutral']))
-        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_cost_ch_factor['Decrease']))
+        # 增加一条：当网络整体能量很低时，成为CH的成本应该降低，以鼓励有能力的节点站出来。
         rules.append(ctrl.Rule(self.network_energy_level['Low'], self.w_cost_ch_factor['Decrease']))
 
-        # 调整 w_rotation_factor
-        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'] & (self.node_self_energy['High'] | self.node_self_energy['Medium']), self.w_rotation_factor['Increase']))
-        rules.append(ctrl.Rule((self.ch_density_global['Too_Low'] | self.ch_density_global['Optimal']) & self.node_self_energy['Low'], self.w_rotation_factor['Decrease']))
-        rules.append(ctrl.Rule(self.ch_density_global['Optimal'] & self.node_self_energy['High'], self.w_rotation_factor['Neutral']))
-        rules.append(ctrl.Rule(self.ch_density_global['Optimal'] & self.node_self_energy['Medium'], self.w_rotation_factor['Decrease']))
-        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_rotation_factor['Decrease']))
+        # ======================================================================
+        # 规则集 3: w_energy_self_factor (自身能量贡献权重) - **修正版**
+        # 主要由节点自身能量决定，并由网络整体能量进行微调。
+        # 这样可以保证任何自身能量状态都有对应的规则。
+        # ======================================================================
+        rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_energy_self_factor['Decrease']))
+        rules.append(ctrl.Rule(self.node_self_energy['Medium'], self.w_energy_self_factor['Neutral']))
+        # 当节点自身能量高时，再考虑网络整体情况
+        rules.append(ctrl.Rule(self.node_self_energy['High'] & self.network_energy_level['High'], self.w_energy_self_factor['Neutral']))
+        rules.append(ctrl.Rule(self.node_self_energy['High'] & (self.network_energy_level['Medium'] | self.network_energy_level['Low']), self.w_energy_self_factor['Increase']))
 
-        # 调整 w_dis (确保前提中的模糊集名称与定义一致)
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'] & (self.ch_density_global['Too_High'] | self.ch_density_global['Optimal']), self.w_dis['Increase']))
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'] & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Too_Low'], self.w_dis['Decrease']))
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Optimal'], self.w_dis['Neutral'])) # Corrected from ['Medium']
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'] & self.ch_density_global['Too_High'], self.w_dis['Increase']))
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['High'] & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
-        rules.append(ctrl.Rule(self.ch_to_bs_dis['High'] & (self.ch_density_global['Too_High'] | self.ch_density_global['Optimal']), self.w_dis['Increase']))
+        # ======================================================================
+        # 规则集 4: w_rotation_factor (轮换收益权重)
+        # 主要由CH密度决定，不应该让能量低的节点被过度鼓励。
+        # ======================================================================
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_rotation_factor['Increase']))
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_rotation_factor['Neutral']))
+        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_rotation_factor['Decrease']))
+        # 增加一条：能量低的节点不应该强调轮换收益
+        rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_rotation_factor['Decrease']))
+
+        # ======================================================================
+        # 规则集 5: w_dis (距离影响权重)
+        # 主要由距离本身决定，并由CH密度微调。
+        # ======================================================================
+        # 距离太近或太远都是缺点，增加惩罚（w_dis -> Increase）
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'],  self.w_dis['Increase']))
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['High'], self.w_dis['Increase']))
+        # 距离适中是优点，降低惩罚（w_dis -> Decrease）
+        rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'], self.w_dis['Decrease']))
+        # 微调：如果CH极度稀缺，可以稍微容忍位置不佳的CH
+        rules.append(ctrl.Rule((self.ch_to_bs_dis['Low'] | self.ch_to_bs_dis['High']) & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
+
 
         if not rules:
-            logger.warning("RewardWeightsFuzzySystem: No specific rules were defined, adding a default neutral rule for all outputs.")
-            default_antecedent = self.network_energy_level['Medium'] # Pick one antecedent for default
-            for out_var in [self.w_members_factor, self.w_energy_self_factor, 
-                            self.w_cost_ch_factor, self.w_rotation_factor, self.w_dis]:
-                if hasattr(out_var, 'terms') and 'Neutral' in out_var.terms: # Check if 'Neutral' is defined
-                     rules.append(ctrl.Rule(default_antecedent, out_var['Neutral']))
-                else: # Fallback if 'Neutral' MF is not defined for some reason
-                     logger.error(f"Cannot add default rule for {out_var.label} as 'Neutral' MF is not defined.")
-        
-        logger.debug(f"Defined {len(rules)} rules for RewardWeightsFuzzySystem.")
+            logger.warning("RewardWeightsFuzzySystem: No rules were defined, this should not happen.")
+            # 添加一个绝对的后备规则
+            rules.append(ctrl.Rule(self.network_energy_level['Medium'], (self.w_members_factor['Neutral'], self.w_cost_ch_factor['Neutral'])))
+
+        logger.debug(f"Defined {len(rules)} new, robust, full-coverage rules for RewardWeightsFuzzySystem.")
         return rules
 
     def compute_reward_weights(self, current_net_energy_level, current_node_self_energy, 
