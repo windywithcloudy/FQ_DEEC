@@ -123,13 +123,25 @@ class NormalNodeCHSelectionFuzzySystem:
         rules.append(ctrl.Rule(self.r_success['Medium'] & self.e_send_total_ratio['High'], self.w_path['High']))
         rules.append(ctrl.Rule(self.r_success['Low'], self.w_path['High']))
         
-        # Rules for w_load
-        rules.append(ctrl.Rule(self.p_cluster_ratio['High'], self.w_load['High']))
-        rules.append(ctrl.Rule(self.p_cluster_ratio['Medium'] & self.e_cluster['Low'], self.w_load['High']))
-        rules.append(ctrl.Rule(self.p_cluster_ratio['Medium'] & self.e_cluster['Medium'], self.w_load['Medium']))
-        rules.append(ctrl.Rule(self.p_cluster_ratio['Low'] & self.e_cluster['Low'], self.w_load['Medium']))
-        rules.append(ctrl.Rule(self.p_cluster_ratio['Medium'] & self.e_cluster['High'], self.w_load['Low']))
-        rules.append(ctrl.Rule(self.p_cluster_ratio['Low'] & (self.e_cluster['Medium'] | self.e_cluster['High']), self.w_load['Low']))
+        # --- [V2-健壮版] Rules for w_load (负载权重) ---
+        # 核心思想：确保全覆盖，消除逻辑死区。
+        # 规则主要由当前负载(p_cluster_ratio)和拥塞风险(d_c_base)决定。
+        
+        # 1. 高风险/高负载情况 -> 高权重
+        rules.append(ctrl.Rule(self.p_cluster_ratio['High'] | self.d_c_base['Near'], self.w_load['High']))
+        
+        # 2. 中等风险/中等负载情况 -> 中权重
+        rules.append(ctrl.Rule(self.p_cluster_ratio['Medium'] & self.d_c_base['Medium'], self.w_load['Medium']))
+        
+        # 3. 低风险/低负载情况 -> 低权重
+        rules.append(ctrl.Rule(self.p_cluster_ratio['Low'] & self.d_c_base['Far'], self.w_load['Low']))
+        
+        # 4. 交叉情况，用于填补空白区域
+        rules.append(ctrl.Rule(self.p_cluster_ratio['Medium'] & self.d_c_base['Far'], self.w_load['Medium'])) # 负载中等但位置安全，中等关注
+        rules.append(ctrl.Rule(self.p_cluster_ratio['Low'] & self.d_c_base['Medium'], self.w_load['Low']))    # 负载低且位置中等，低关注
+
+        # 5. 补充规则，确保即使能量很低，如果负载高或位置危险，依然要高度关注负载
+        rules.append(ctrl.Rule(self.e_cluster['Low'] & (self.p_cluster_ratio['High'] | self.d_c_base['Near']), self.w_load['High']))
 
         # Rules for w_dist_bs
         # 优化后版本（5条规则）
@@ -691,6 +703,273 @@ class RewardWeightsFuzzySystemForCHCompetition:
             logger.error(f"  Input net_energy: {current_net_energy_level}, self_energy: {current_node_self_energy}, density: {current_ch_density_global}, bs_dist: {current_ch_to_bs_dis_normalized}")
             return {'w_members_factor': 1.0, 'w_energy_self_factor': 1.0, 
                     'w_cost_ch_factor': 1.0, 'w_rotation_factor': 1.0, 'w_dis': 1.0}
+
+# in fuzzy.py
+# (确保文件顶部有 import numpy as np, skfuzzy as fuzz, from skfuzzy import control as ctrl)
+
+# =============================================================================
+# Meta-Fuzzy Controller for CH Selection Strategy
+# =============================================================================
+class CHSelectionStrategyFuzzySystem:
+    def __init__(self, main_sim_config):
+        """
+        初始化高阶模糊逻辑控制器，用于动态调整CH选举策略的权重。
+        """
+        self.main_config = main_sim_config
+        logger.info("Initializing Meta-Fuzzy Controller for CH Selection Strategy...")
+
+         # --- Antecedents (Inputs) ---
+        self.net_health_pdr = None      # 网络PDR (0-1)
+        self.net_energy_reserve = None  # 网络平均能量 (0-1)
+        self.isolated_node_rate = None  # 孤立节点率 (0-1)
+        self.net_congestion_level = None# 网络拥塞水平 (0-1)
+        
+        # --- Consequents (Outputs) ---
+        self.p_opt_adjustment_factor = None
+
+        self._define_antecedents_and_consequents()
+        self.rules = self._define_rules()
+        
+        if not self.rules:
+            logger.error("CHSelectionStrategyFuzzySystem: No rules defined!")
+            self.control_system = None
+        else:
+            self.control_system = ctrl.ControlSystem(self.rules)
+            logger.info("CHSelectionStrategyFuzzySystem: ControlSystem built successfully.")
+
+    # in fuzzy.py -> class CHSelectionStrategyFuzzySystem
+
+    def _define_antecedents_and_consequents(self):
+        """定义输入和输出变量的模糊集。"""
+        # --- 输入1: 网络健康度 (PDR) ---
+        universe_pdr = np.arange(0, 1.01, 0.01)
+        self.net_health_pdr = ctrl.Antecedent(universe_pdr, 'net_health_pdr')
+        self.net_health_pdr['Poor'] = fuzz.zmf(self.net_health_pdr.universe, 0.2, 0.4)
+        self.net_health_pdr['Acceptable'] = fuzz.trimf(self.net_health_pdr.universe, [0.3, 0.5, 0.7])
+        self.net_health_pdr['Good'] = fuzz.smf(self.net_health_pdr.universe, 0.6, 0.8)
+
+        # --- 输入2: 网络能量储备 ---
+        universe_energy = np.arange(0, 1.01, 0.01)
+        self.net_energy_reserve = ctrl.Antecedent(universe_energy, 'net_energy_reserve')
+        self.net_energy_reserve['Critical'] = fuzz.zmf(self.net_energy_reserve.universe, 0.15, 0.35)
+        self.net_energy_reserve['Medium'] = fuzz.trimf(self.net_energy_reserve.universe, [0.3, 0.55, 0.8])
+        self.net_energy_reserve['High'] = fuzz.smf(self.net_energy_reserve.universe, 0.7, 0.9)
+
+        # --- [新增] 输入3: 孤立节点率 ---
+        # 反映网络覆盖的完整性
+        universe_isolated_rate = np.arange(0, 1.01, 0.01)
+        self.isolated_node_rate = ctrl.Antecedent(universe_isolated_rate, 'isolated_node_rate')
+        self.isolated_node_rate['Low'] = fuzz.zmf(self.isolated_node_rate.universe, 0.05, 0.15)
+        self.isolated_node_rate['Medium'] = fuzz.trimf(self.isolated_node_rate.universe, [0.1, 0.2, 0.3])
+        self.isolated_node_rate['High'] = fuzz.smf(self.isolated_node_rate.universe, 0.25, 0.4)
+
+        # --- [新增] 输入4: 网络拥塞水平 ---
+        # 反映CH转发缓存的平均占用率
+        universe_congestion = np.arange(0, 1.01, 0.01)
+        self.net_congestion_level = ctrl.Antecedent(universe_congestion, 'net_congestion_level')
+        self.net_congestion_level['Low'] = fuzz.zmf(self.net_congestion_level.universe, 0.2, 0.4)
+        self.net_congestion_level['Medium'] = fuzz.trimf(self.net_congestion_level.universe, [0.3, 0.5, 0.7])
+        self.net_congestion_level['High'] = fuzz.smf(self.net_congestion_level.universe, 0.6, 0.8)
+
+        # [核心修改] 定义新的输出变量
+        universe_factor = np.arange(0.5, 2.01, 0.01) # 调整因子范围：[0.5, 2.0]
+        self.p_opt_adjustment_factor = ctrl.Consequent(universe_factor, 'p_opt_adjustment_factor')
+        self.p_opt_adjustment_factor['Decrease_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.5, 0.5, 0.8])
+        self.p_opt_adjustment_factor['Decrease_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.7, 0.9, 1.0])
+        self.p_opt_adjustment_factor['Neutral'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.95, 1.0, 1.05])
+        self.p_opt_adjustment_factor['Increase_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.0, 1.1, 1.3])
+        self.p_opt_adjustment_factor['Increase_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.2, 1.5, 2.0])
+
+    # in fuzzy.py -> class CHSelectionStrategyFuzzySystem
+
+    def _define_rules(self):
+        """定义核心策略规则。"""
+        rules = []
+        
+            # 规则组1：服务质量优先
+        # PDR差或孤立节点多，必须显著增加CH数量来修复网络
+        rule1 = ctrl.Rule(self.net_health_pdr['Poor'] | self.isolated_node_rate['High'], 
+                        self.p_opt_adjustment_factor['Increase_Significantly'])
+        # PDR尚可，轻微增加CH以提升服务
+        rule2 = ctrl.Rule(self.net_health_pdr['Acceptable'],
+                        self.p_opt_adjustment_factor['Increase_Slightly'])
+
+        # 规则组2：拥塞处理
+        # 拥塞严重，需要增加CH来分担流量
+        rule3 = ctrl.Rule(self.net_congestion_level['High'],
+                        self.p_opt_adjustment_factor['Increase_Slightly'])
+
+        # 规则组3：能量权衡
+        # 只有在服务质量良好(PDR Good)的情况下，才考虑根据能量进行调整
+        # 能量高，服务好 -> 维持现状
+        rule4 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['High'],
+                        self.p_opt_adjustment_factor['Neutral'])
+        # 能量中等，服务好 -> 轻微减少CH，开始节能
+        rule5 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['Medium'],
+                        self.p_opt_adjustment_factor['Decrease_Slightly'])
+        # 能量危急，服务好 -> 显著减少CH，全力保生存
+        rule6 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['Critical'],
+                        self.p_opt_adjustment_factor['Decrease_Significantly'])
+
+        rules.extend([rule1, rule2, rule3, rule4, rule5, rule6])
+        return rules
+
+
+    def compute_p_opt_factor(self, pdr, energy, isolated_rate, congestion):
+        """
+        [V8.0 健壮版] 计算p_opt调整因子。
+        返回一个单一的浮点数。
+        """
+        # 1. 检查控制系统是否已构建
+        if self.control_system is None:
+            logger.error("CHSelectionStrategyFuzzySystem: ControlSystem is not built. Returning neutral factor 1.0.")
+            return 1.0  # 返回一个中性的、不会造成破坏的默认值
+
+        simulation = ctrl.ControlSystemSimulation(self.control_system)
+        
+        # 2. 裁剪并设置所有输入值
+        simulation.input['net_health_pdr'] = np.clip(pdr, 0, 1)
+        simulation.input['net_energy_reserve'] = np.clip(energy, 0, 1)
+        simulation.input['isolated_node_rate'] = np.clip(isolated_rate, 0, 1)
+        simulation.input['net_congestion_level'] = np.clip(congestion, 0, 1)
+        
+        # 3. 计算并安全地获取输出
+        try:
+            simulation.compute()
+            
+            # 使用 .get() 方法来安全地访问字典，避免KeyError
+            # 如果'p_opt_adjustment_factor'不存在，则返回一个中性的默认值 1.0
+            adjustment_factor = simulation.output.get('p_opt_adjustment_factor', 1.0)
+            
+            if adjustment_factor is None:
+                logger.warning("Fuzzy computation resulted in None for p_opt_adjustment_factor. Returning 1.0.")
+                return 1.0
+                
+            return adjustment_factor
+                
+        except Exception as e:
+            logger.error(f"Error during CHSelectionStrategyFuzzySystem computation: {e}", exc_info=True)
+            # 在发生未知错误时，也返回一个安全的中性值
+            return 1.0
+        
+# in fuzzy.py, at the end of the file
+
+# =============================================================================
+# Fuzzy System for Guiding CH Declaration Propensity
+# =============================================================================
+class CHDeclarationFuzzySystem:
+    def __init__(self, main_sim_config):
+        self.main_config = main_sim_config
+        logger.info("Initializing CH Declaration Propensity Fuzzy System...")
+
+        # --- Antecedents (Inputs) ---
+        self.node_energy = None             # 节点自身归一化能量 [0, 1]
+        self.distance_to_bs = None          # 节点到BS的归一化距离 [0, 1]
+        self.local_density = None           # 节点的局部密度（归一化邻居数）[0, 1]
+        self.coverage_gini = None           # CH覆盖范围的基尼系数 [0, 1]，值越大越不均衡
+
+        # --- Consequent (Output) ---
+        self.declaration_propensity = None  # 宣告倾向性 [0, 1]
+
+        self._define_antecedents_and_consequents()
+        self.rules = self._define_rules()
+        
+        if not self.rules:
+            logger.error("CHDeclarationFuzzySystem: No rules defined!")
+            self.control_system = None
+        else:
+            self.control_system = ctrl.ControlSystem(self.rules)
+            logger.info("CHDeclarationFuzzySystem: ControlSystem built successfully.")
+
+    def _define_antecedents_and_consequents(self):
+        """定义输入和输出变量的模糊集。"""
+        # --- Inputs ---
+        universe_norm = np.arange(0, 1.01, 0.01)
+
+        self.node_energy = ctrl.Antecedent(universe_norm, 'node_energy')
+        self.node_energy['Low'] = fuzz.zmf(self.node_energy.universe, 0.2, 0.4)
+        self.node_energy['Medium'] = fuzz.trimf(self.node_energy.universe, [0.3, 0.5, 0.7])
+        self.node_energy['High'] = fuzz.smf(self.node_energy.universe, 0.6, 0.8)
+
+        self.distance_to_bs = ctrl.Antecedent(universe_norm, 'distance_to_bs')
+        self.distance_to_bs['Near'] = fuzz.zmf(self.distance_to_bs.universe, 0.2, 0.4)
+        self.distance_to_bs['Medium'] = fuzz.trimf(self.distance_to_bs.universe, [0.3, 0.5, 0.7])
+        self.distance_to_bs['Far'] = fuzz.smf(self.distance_to_bs.universe, 0.6, 0.8)
+
+        self.local_density = ctrl.Antecedent(universe_norm, 'local_density')
+        self.local_density['Sparse'] = fuzz.zmf(self.local_density.universe, 0.1, 0.3)
+        self.local_density['Medium'] = fuzz.trimf(self.local_density.universe, [0.2, 0.4, 0.6])
+        self.local_density['Dense'] = fuzz.smf(self.local_density.universe, 0.5, 0.7)
+
+        self.coverage_gini = ctrl.Antecedent(universe_norm, 'coverage_gini')
+        self.coverage_gini['Balanced'] = fuzz.zmf(self.coverage_gini.universe, 0.2, 0.4) # 基尼系数小，均衡
+        self.coverage_gini['Unbalanced'] = fuzz.smf(self.coverage_gini.universe, 0.3, 0.5) # 基尼系数大，不均衡
+
+        # --- Output ---
+        self.declaration_propensity = ctrl.Consequent(universe_norm, 'declaration_propensity')
+        self.declaration_propensity['Very_Low'] = fuzz.zmf(self.declaration_propensity.universe, 0.1, 0.2)
+        self.declaration_propensity['Low'] = fuzz.trimf(self.declaration_propensity.universe, [0.1, 0.25, 0.4])
+        self.declaration_propensity['Medium'] = fuzz.trimf(self.declaration_propensity.universe, [0.3, 0.5, 0.7])
+        self.declaration_propensity['High'] = fuzz.trimf(self.declaration_propensity.universe, [0.6, 0.75, 0.9])
+        self.declaration_propensity['Very_High'] = fuzz.smf(self.declaration_propensity.universe, 0.8, 0.9)
+
+    # in fuzzy.py -> class CHDeclarationFuzzySystem
+
+    # in fuzzy.py -> class CHDeclarationFuzzySystem
+
+    # in fuzzy.py -> class CHDeclarationFuzzySystem
+
+    # in fuzzy.py -> class CHDeclarationFuzzySystem
+
+    def _define_rules(self):
+        """
+        [V10-解耦版] 定义一个绝对无死角的、全覆盖的核心引导规则。
+        核心思想：每个输入独立地对输出产生影响，由模糊系统自动聚合。
+        """
+        rules = []
+
+        # 规则组1：能量的影响 (Energy Contribution)
+        # 能量越高，倾向性越高
+        rules.append(ctrl.Rule(self.node_energy['Low'], self.declaration_propensity['Very_Low']))
+        rules.append(ctrl.Rule(self.node_energy['Medium'], self.declaration_propensity['Medium']))
+        rules.append(ctrl.Rule(self.node_energy['High'], self.declaration_propensity['High']))
+
+        # 规则组2：到BS距离的影响 (Distance Contribution)
+        # 越远（通常意味着越在边缘），越需要被扶持，倾向性越高
+        rules.append(ctrl.Rule(self.distance_to_bs['Near'], self.declaration_propensity['Low']))
+        rules.append(ctrl.Rule(self.distance_to_bs['Medium'], self.declaration_propensity['Medium']))
+        rules.append(ctrl.Rule(self.distance_to_bs['Far'], self.declaration_propensity['High']))
+
+        # 规则组3：局部密度的影响 (Density Contribution)
+        # 越稀疏，越需要成为CH来服务该区域，倾向性越高
+        rules.append(ctrl.Rule(self.local_density['Sparse'], self.declaration_propensity['High']))
+        rules.append(ctrl.Rule(self.local_density['Medium'], self.declaration_propensity['Medium']))
+        rules.append(ctrl.Rule(self.local_density['Dense'], self.declaration_propensity['Low']))
+
+        # 规则组4：网络覆盖均衡度的影响 (Gini Contribution)
+        # 网络越不均衡，越需要一个“颠覆性”的高倾向性建议；网络均衡，则倾向性建议趋于中性
+        rules.append(ctrl.Rule(self.coverage_gini['Balanced'], self.declaration_propensity['Medium']))
+        rules.append(ctrl.Rule(self.coverage_gini['Unbalanced'], self.declaration_propensity['Very_High']))
+
+        logger.debug(f"Defined {len(rules)} decoupled rules for CHDeclarationFuzzySystem.")
+        return rules
+
+    def compute_propensity(self, energy, distance, density, gini):
+        if self.control_system is None:
+            return 0.5 # Fallback
+
+        simulation = ctrl.ControlSystemSimulation(self.control_system)
+        simulation.input['node_energy'] = np.clip(energy, 0, 1)
+        simulation.input['distance_to_bs'] = np.clip(distance, 0, 1)
+        simulation.input['local_density'] = np.clip(density, 0, 1)
+        simulation.input['coverage_gini'] = np.clip(gini, 0, 1)
+        
+        try:
+            simulation.compute()
+            return simulation.output['declaration_propensity']
+        except Exception as e:
+            logger.warning(f"CHDeclarationFuzzySystem compute failed: {e}. Returning fallback 0.5")
+            return 0.5
 # =============================================================================
 # Example Usage
 # =============================================================================

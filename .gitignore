@@ -5,3 +5,11 @@ vs_py/Q_DEEC/simulation.log
 vs_py/Q_DEEC/simulation.log.1
 vs_py/Q_DEEC/simulation.log.2
 vs_py/Q_DEEC/simulation.log.3
+vs_py/Q_DEEC/simulation.log
+vs_py/Q_DEEC/logs/
+vs_py/Q_DEEC/utils/__pycache__/
+vs_py/Q_DEEC/src/__pycache__/
+vs_py/Q_DEEC/src/__pycache__/env.cpython-311.pyc
+vs_py/Q_DEEC/utils/__pycache__/fuzzy.cpython-311.pyc
+vs_py/Q_DEEC/utils/__pycache__/log.cpython-311.pyc
+vs_py/Q_DEEC/utils/__pycache__/virtual.cpython-311.pyc

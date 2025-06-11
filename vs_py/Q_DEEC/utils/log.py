@@ -1,44 +1,43 @@
 # utils/log.py
 import logging
 import sys
-from logging.handlers import RotatingFileHandler # 导入
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-def setup_logger(log_level=logging.INFO, log_file=None,max_bytes=5*1024*1024, backup_count=5):
+def setup_logger(log_level=logging.INFO, log_file_path=None, max_bytes=5*1024*1024, backup_count=5):
     """
-    配置并返回一个logger实例。
+    配置并返回一个名为 "WSN_Simulation" 的logger实例。
     """
+    # 获取名为 "WSN_Simulation" 的 logger，这是我们整个项目的统一logger名称
     logger = logging.getLogger("WSN_Simulation")
     logger.setLevel(log_level)
 
     # 创建格式化器
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # 清除已有的handlers，防止重复添加 (特别是在Jupyter等环境中)
+    # 清除已有的handlers，防止在多进程或重复调用时出现问题
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # 控制台处理器
+    # 控制台处理器 (所有进程共享，打印到主控制台)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
-    # 文件处理器 (可选)
-    if log_file:
-        # 当日志文件达到 max_bytes 时，会重命名为 log_file.1, log_file.2 ...
-        # 最多保留 backup_count 个备份文件。当创建新文件时，最旧的备份会被删除。
-        file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, 
+    # 文件处理器 (如果提供了文件路径)
+    if log_file_path:
+        # 确保日志目录存在
+        log_dir = Path(log_file_path).parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 创建一个特定于该进程的文件处理器
+        file_handler = RotatingFileHandler(log_file_path, maxBytes=max_bytes, 
                                            backupCount=backup_count, encoding='utf-8')
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     
     return logger
 
-# 在其他模块中通过 from utils.log import logger 来使用
-# logger = setup_logger() 
-# 如果希望在导入时就配置好，可以直接调用，或者让 main.py 来调用并传递实例
-# 为简单起见，这里直接创建一个默认logger供其他模块导入
-SIMULATION_LOG_PATH = Path(__file__).resolve().parent.parent / "simulation.log"
-logger = setup_logger(log_file=str(SIMULATION_LOG_PATH), 
-                      max_bytes=2*1024*1024, # 例如，每个日志文件最大2MB
-                      backup_count=3)         # 保留最近3个备份 + 当前日志文件
+# --- [核心修改] 不再在这里创建全局logger实例 ---
+# 其他模块将通过 logging.getLogger("WSN_Simulation") 来获取logger
+# 而这个logger的配置工作，将由主程序或每个进程的入口来完成。

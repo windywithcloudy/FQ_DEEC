@@ -1,7 +1,8 @@
 # utils/virtual.py
 import matplotlib.pyplot as plt
 from pathlib import Path
-from .log import logger 
+import logging # 导入标准的logging库
+logger = logging.getLogger("WSN_Simulation")
 
 plt.rcParams['font.sans-serif'] = ['SimHei']  
 plt.rcParams['axes.unicode_minus'] = False
@@ -73,56 +74,52 @@ def visualize_network(nodes_data, base_station_pos, area_dims, filename=DEFAULT_
 
     plt.scatter(base_x, base_y, s=180, c=bs_color, marker='^', edgecolors='black', linewidth=1, label='基站', zorder=4) # type: ignore
     
-    # --- 绘制连线 ---
     for node in nodes_data:
         if node["status"] != "active":
             continue
 
         # 1. 普通节点连接到其CH
-        if node.get("role_override") != "direct_to_bs" and \
-           node["role"] == "normal" and \
-           node["cluster_id"] in active_ch_ids_map: # 确保连接到的是本epoch的活跃CH
-            ch_node = active_ch_ids_map.get(node["cluster_id"]) # 从map中获取，保证是活跃的
-            if ch_node: # ch_node 肯定存在且活跃
+        # 确保节点是普通节点，且它的簇头是本轮确认的活跃CH
+        if node["role"] == "normal" and node["cluster_id"] in active_ch_ids_map:
+            ch_node = active_ch_ids_map.get(node["cluster_id"])
+            if ch_node:
                 plt.plot([node["position"][0], ch_node["position"][0]],
                          [node["position"][1], ch_node["position"][1]],
                          linestyle=':', linewidth=0.7, color='gray', alpha=0.5, zorder=1)
         
         # 2. 直连BS的节点连接到BS
-        elif node.get("role_override") == "direct_to_bs":
+        elif node.get("can_connect_bs_directly"):
              plt.plot([node["position"][0], base_x],
                       [node["position"][1], base_y],
                       linestyle='--', linewidth=0.8, color=direct_bs_color, alpha=0.7, zorder=1)
         
-        # 3. *** 新增：活跃CH连接到其选择的下一跳 ***
-        elif node["id"] in active_ch_ids_map: # 如果当前节点是活跃CH
+        # 3. 活跃CH连接到其选择的下一跳
+        if node["id"] in active_ch_ids_map: # CH也需要检查它的路由
             chosen_next_hop_id = node.get("chosen_next_hop_id")
-            if chosen_next_hop_id is not None: # 并且它已经选择了一个下一跳
+            if chosen_next_hop_id is not None:
                 next_hop_pos = None
-                line_style = '-.' # CH到CH的路由用点划线
+                line_style = '-.' 
                 line_color = ch_route_color
                 line_width = 1.0
 
-                if chosen_next_hop_id == bs_id_for_routing: # 下一跳是基站
+                if chosen_next_hop_id == bs_id_for_routing:
                     next_hop_pos = [base_x, base_y]
-                    line_style = '-' # CH到BS的路由用实线
-                elif 0 <= chosen_next_hop_id < len(nodes_data) and \
-                     nodes_data[chosen_next_hop_id]["status"] == "active":
-                    
+                    line_style = '-'
+                elif 0 <= chosen_next_hop_id < len(nodes_data) and nodes_data[chosen_next_hop_id]["status"] == "active":
                     next_hop_node_data_viz = nodes_data[chosen_next_hop_id]
-                    if next_hop_node_data_viz["id"] in active_ch_ids_map: # 下一跳是另一个活跃CH
-                        next_hop_pos = next_hop_node_data_viz["position"]
-                        # current_line_color 和 style 保持 ch_route_color 和 '-.'
-                    elif next_hop_node_data_viz.get("can_connect_bs_directly", False): # !!! 新增：下一跳是直连BS的节点 !!!
-                        next_hop_pos = next_hop_node_data_viz["position"]
-                        current_line_color = ch_to_direct_node_route_color # 使用新颜色
-                # else: 下一跳无效或不是活跃CH，不画
-
+                    next_hop_pos = next_hop_node_data_viz["position"]
+                    if next_hop_node_data_viz.get("can_connect_bs_directly", False):
+                        line_color = ch_to_direct_node_route_color
+                        line_style = '--'
+                
                 if next_hop_pos:
                     plt.plot([node["position"][0], next_hop_pos[0]],
                             [node["position"][1], next_hop_pos[1]],
-                            linestyle=line_style, linewidth=line_width, color=line_color, # 使用 current_ 前缀的变量
-                            alpha=0.8, zorder=2) # zorder=2 使其在普通节点连线之上
+                            linestyle=line_style, 
+                            linewidth=line_width, 
+                            color=line_color,
+                            alpha=0.8, 
+                            zorder=2)
                     # (可选) 绘制箭头指示方向
                     # plt.arrow(node["position"][0], node["position"][1],
                     #           next_hop_pos[0] - node["position"][0],
