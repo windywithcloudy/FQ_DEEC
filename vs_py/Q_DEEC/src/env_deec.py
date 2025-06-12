@@ -5,6 +5,7 @@ import math
 from env import WSNEnv # 从你的核心env文件继承
 import logging # 导入标准的logging库
 logger = logging.getLogger("WSN_Simulation")
+import networkx as nx
 
 class WSNEnvDEEC(WSNEnv):
     """
@@ -131,14 +132,15 @@ class WSNEnvDEEC(WSNEnv):
                 if chosen_ch_id == -1:
                     logger.debug(f"节点 {node_data['id']} 在DEEC模式下找不到可达的CH。")
 
-    # in src/env_deec.py
-
+    # in env_deec.py
     def _run_ch_routing_phase(self):
         """
-        [DEEC专属-PDR修复版] CH进行数据路由。
-        除了确定下一跳，还检查整条链路是否能通到BS。
+        [DEEC专属-最终修复V3] CH进行数据路由。
+        使用唯一的 NO_PATH_ID 来区分“无路可走”和“下一跳是BS”，解决逻辑歧义。
         """
         # logger.info("DEEC模式：CH进行数据路由...")
+        #logger.info("--- DEEC ROUTING DEBUG START ---") # 您可以保留或删除调试日志
+        num_potential_direct_linkers = 0
 
         # 1. 为每个CH确定其直接的下一跳
         for ch_id in self.confirmed_cluster_heads_for_epoch:
@@ -146,33 +148,42 @@ class WSNEnvDEEC(WSNEnv):
             if ch_node["status"] != "active": 
                 continue
 
-            ch_node["chosen_next_hop_id"] = -1 # 默认无路可走
-            dist_to_bs = self.calculate_distance_to_bs(ch_id)
+            # [核心修改] 使用新的 NO_PATH_ID 作为默认值
+            ch_node["chosen_next_hop_id"] = self.NO_PATH_ID 
+            
+            ch_current_range = ch_node.get("current_communication_range", ch_node["base_communication_range"])
+            dist_to_bs = self.calculate_distance_to_base_station(ch_id)
+            
+            #logger.info(f"  CH {ch_id}: dist_to_bs={dist_to_bs:.2f}, current_range={ch_current_range:.2f}")
 
-            # 优先直连BS
-            if dist_to_bs <= ch_node["base_communication_range"]:
+            # 决策优先级调整：直连BS是最高优先级！
+            if dist_to_bs <= ch_current_range:
                 ch_node["chosen_next_hop_id"] = self.BS_ID
+                num_potential_direct_linkers += 1
+                #logger.info(f"    DECISION: CH {ch_id} WILL connect to BS. ID set to {self.BS_ID}.")
                 continue
 
-            # 寻找最佳中继CH
-            best_relay_ch_id = -1
-            min_relay_dist = float('inf')
-            
+            # 如果不能直连BS，才开始寻找最佳中继CH
+            candidate_relays = {}
             for other_ch_id in self.confirmed_cluster_heads_for_epoch:
                 if ch_id == other_ch_id: continue
                 other_ch_node = self.nodes[other_ch_id]
                 if other_ch_node["status"] != "active": continue
 
                 dist_to_other = self.calculate_distance(ch_id, other_ch_id)
-                if dist_to_other <= ch_node["base_communication_range"]:
-                    if self.calculate_distance_to_bs(other_ch_id) < dist_to_bs:
-                        if dist_to_other < min_relay_dist:
-                            min_relay_dist = dist_to_other
-                            best_relay_ch_id = other_ch_id
-            
-            ch_node["chosen_next_hop_id"] = best_relay_ch_id
+                other_current_range = other_ch_node.get("current_communication_range", other_ch_node["base_communication_range"])
 
-        # 2. [新增] 验证每个CH的完整路径，并标记其是否能成功送达
+                if dist_to_other <= ch_current_range and dist_to_other <= other_current_range:
+                    if self.calculate_distance_to_base_station(other_ch_id) < dist_to_bs:
+                        candidate_relays[other_ch_id] = dist_to_other
+            
+            if candidate_relays:
+                best_relay_ch_id = min(candidate_relays, key=lambda k:candidate_relays[k])
+                ch_node["chosen_next_hop_id"] = best_relay_ch_id
+        
+        #logger.info(f"--- DEEC ROUTING DEBUG END --- Found {num_potential_direct_linkers} CHs that can directly link to BS.")
+
+        # 2. 验证每个CH的完整路径
         for ch_id in self.confirmed_cluster_heads_for_epoch:
             ch_node = self.nodes[ch_id]
             if ch_node["status"] != "active":
@@ -183,30 +194,35 @@ class WSNEnvDEEC(WSNEnv):
             current_node_id = ch_id
             can_reach_bs = False
             
-            # 沿着下一跳路径走，最多走CH的数量次（防止无限循环）
-            for _ in range(len(self.confirmed_cluster_heads_for_epoch) + 1):
-                next_hop_id = self.nodes[current_node_id].get("chosen_next_hop_id", -1)
+            for _ in range(len(self.confirmed_cluster_heads_for_epoch) + 2):
+                if not (0 <= current_node_id < len(self.nodes)): break
+                
+                # [核心修改] 使用 NO_PATH_ID 作为 get 的默认值
+                next_hop_id = self.nodes[current_node_id].get("chosen_next_hop_id", self.NO_PATH_ID)
                 
                 if next_hop_id == self.BS_ID:
                     can_reach_bs = True
                     break
                 
-                if next_hop_id == -1 or next_hop_id in path: # 遇到死胡同或循环
+                # [核心修改] 判断路径中断的条件
+                if next_hop_id == self.NO_PATH_ID or next_hop_id in path:
                     break
                 
-                # 移动到下一跳
                 path.append(next_hop_id)
                 current_node_id = next_hop_id
             
             ch_node["can_route_to_bs"] = can_reach_bs
-            if not can_reach_bs:
-                logger.warning(f"DEEC模式：CH {ch_id} 的路由链无法到达BS。路径尝试: {path}")
+        
+            #if can_reach_bs:
+             #   logger.info(f"    PATH VALIDATION: CH {ch_id} can reach BS. Path: {path + [self.BS_ID]}")
+            #else:
+            #    logger.debug(f"    PATH VALIDATION: CH {ch_id} CANNOT reach BS. Path attempt: {path}")
 
-    # in src/env_deec.py
-
-    def _execute_energy_consumption_for_round(self):
+    # in env_deec.py
+    # in env_deec.py
+    def _apply_energy_consumption(self):
         """
-        [DEEC专属-PDR修复版] 为DEEC模式重写能量消耗和数据包送达统计。
+        [DEEC专属-最终修复V6.1] 使用清晰的步骤，分离PDR统计与能耗计算，并使用 NO_PATH_ID。
         """
         energy_cfg = self.config.get('energy', {})
         packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
@@ -214,74 +230,107 @@ class WSNEnvDEEC(WSNEnv):
         idle_listening_cost = float(energy_cfg.get('idle_listening_per_round', 1e-6))
         sensing_cost = float(energy_cfg.get('sensing_per_round', 5e-7))
 
-        energy_costs = {node["id"]: idle_listening_cost + sensing_cost for node in self.nodes}
-
-        # 1. 普通节点 -> CH
+        energy_costs = {node["id"]: idle_listening_cost + sensing_cost for node in self.nodes if node["status"] == "active"}
+        
+        # 步骤 1: 统计每个CH初始负责的数据包总数，并计算普通节点->CH的能耗
+        packets_managed_by_ch = {ch_id: 0 for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"}
+        
         for node in self.nodes:
-            if node["status"] == "active" and node["role"] == "normal" and node["cluster_id"] >= 0:
+            if node["status"] != "active": continue
+            
+            if node["role"] == "cluster_head":
+                if node["id"] in packets_managed_by_ch:
+                    packets_managed_by_ch[node["id"]] += 1
+            elif node["role"] == "normal" and node.get("cluster_id", -1) >= 0:
                 ch_id = node["cluster_id"]
-                if self.nodes[ch_id]["status"] == "active":
+                if ch_id < len(self.nodes) and self.nodes[ch_id]["status"] == "active" and ch_id in packets_managed_by_ch:
+                    packets_managed_by_ch[ch_id] += 1
+                    # 计算普通节点 -> CH 的能耗
                     dist = self.calculate_distance(node["id"], ch_id)
                     tx_energy = self.calculate_transmission_energy(dist, packet_size)
-                    energy_costs[node["id"]] += tx_energy
+                    if node["id"] in energy_costs: energy_costs[node["id"]] += tx_energy
                     rx_energy = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
-                    energy_costs[ch_id] += rx_energy
+                    if ch_id in energy_costs: energy_costs[ch_id] += rx_energy
 
-        # 2. CH 融合 & 路由 & 数据送达统计
+        # 步骤 2: 计算所有CH的融合和路由能耗
         for ch_id in self.confirmed_cluster_heads_for_epoch:
             ch_node = self.nodes[ch_id]
             if ch_node["status"] != "active": continue
 
             # a. 融合能耗
-            members = [n for n in self.nodes if n.get("cluster_id") == ch_id]
-            num_fusion_packets = len(members) + 1
-            agg_energy = num_fusion_packets * agg_cost_per_bit * packet_size
-            energy_costs[ch_id] += agg_energy
+            num_initial_packets = packets_managed_by_ch.get(ch_id, 0)
+            if num_initial_packets > 0 and ch_id in energy_costs:
+                energy_costs[ch_id] += num_initial_packets * agg_cost_per_bit * packet_size
 
-            # b. 路由链能耗计算 和 PDR统计
-            current_node_id = ch_id
-            # 沿着之前计算好的路径走
-            for _ in range(len(self.confirmed_cluster_heads_for_epoch) + 1):
-                sender_node = self.nodes[current_node_id]
-                next_hop_id = sender_node.get("chosen_next_hop_id", -1)
-
-                if next_hop_id == -1: break # 路径中断
-
-                # 计算发送能耗
-                if next_hop_id == self.BS_ID:
-                    dist = self.calculate_distance_to_bs(current_node_id)
+            # b. 路由能耗 (每个CH只负责发送自己的聚合包一次)
+            next_hop = ch_node.get("chosen_next_hop_id", self.NO_PATH_ID)
+            
+            # [核心修改] 只要有下一跳（不是无路可走），就要消耗发送能量
+            if next_hop != self.NO_PATH_ID:
+                if next_hop == self.BS_ID:
+                    dist = self.calculate_distance_to_base_station(ch_id)
                 else:
-                    dist = self.calculate_distance(current_node_id, next_hop_id)
+                    dist = self.calculate_distance(ch_id, next_hop)
                 
+                # 发送一个聚合包的能耗
                 tx_energy = self.calculate_transmission_energy(dist, packet_size)
-                energy_costs[current_node_id] += tx_energy
+                if ch_id in energy_costs: energy_costs[ch_id] += tx_energy
 
-                # 如果下一跳不是BS，计算接收能耗
-                if next_hop_id != self.BS_ID:
-                    if self.nodes[next_hop_id]["status"] == "active":
-                        rx_energy = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
-                        energy_costs[next_hop_id] += rx_energy
-                    else:
-                        break # 下一跳死亡，路径中断
-                
-                current_node_id = next_hop_id
-                if current_node_id == self.BS_ID: break # 到达BS
+                # 下一跳的接收能耗
+                if next_hop != self.BS_ID and next_hop < len(self.nodes) and self.nodes[next_hop]["status"] == "active" and next_hop in energy_costs:
+                    rx_energy = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+                    energy_costs[next_hop] += rx_energy
 
-            # [核心] PDR统计
-            if ch_node.get("can_route_to_bs", False):
-                # 这个CH和它所有成员的数据包都算成功送达
-                num_delivered_packets = num_fusion_packets
-                self.sim_packets_delivered_bs_this_round += num_delivered_packets
-                # 可以在这里简化延迟计算，比如跳数
-                # self.sim_total_delay_this_round += len(path) * num_delivered_packets
-                # self.sim_num_packets_for_delay_this_round += num_delivered_packets
+        # 步骤 3: PDR统计 (完全独立的逻辑)
+        for ch_id, num_packets in packets_managed_by_ch.items():
+            ch_node = self.nodes[ch_id]
+            if ch_node["status"] == "active" and ch_node.get("can_route_to_bs", False):
+                if num_packets > 0:
+                    self.sim_packets_delivered_bs_this_round += num_packets
+                    self.sim_packets_delivered_bs_total += num_packets
+                    #logger.info(f"    PDR LOG: CH {ch_id} and its {num_packets - 1} members' packets delivered.")
 
-        # 3. 直连BS节点（如果有的话）
-        # 在你的DEEC模型中，这个逻辑可以被简化或合并，因为can_connect_bs_directly的节点
-        # 在_run_ch_routing_phase中会被直接分配BS_ID作为下一跳
-        # 它们的能量消耗和PDR已经在上面的循环中被正确处理了。
-
-        # 4. 统一扣除能量
+        # 步骤 4: 统一扣除能量
         for node_id, cost in energy_costs.items():
             if cost > 0:
                 self.consume_node_energy(node_id, cost)
+
+    def step(self, current_round_num):
+        """
+        [DEEC专属] 重写 step 函数，以调用DEEC的特定逻辑流程。
+        """
+        self.current_round = current_round_num
+        logger.info(f"--- 开始第 {self.current_round} 轮 (DEEC模式) ---")
+
+        # 阶段 0: 准备工作
+        # DEEC的准备工作很简单，甚至可以在epoch开始时做
+        # 这里我们遵循父类的结构，每轮都调用
+        self._prepare_for_new_round()
+
+        # 阶段 1: Epoch 开始时的特殊处理 (CH 选举)
+        # 在DEEC中，选举和分配通常在一个Epoch内是固定的
+        if self.current_round % self.epoch_length == 0:
+            self._run_epoch_start_phase()
+            self._run_normal_node_selection_phase()
+        
+        # 阶段 2: CH 选择下一跳进行路由
+        # DEEC的路由很简单，可以每轮都计算，也可以在epoch开始时计算一次
+        # 为简单起见，我们每轮都重新计算
+        self._run_ch_routing_phase()
+        
+        # 阶段 3: 执行本轮所有暂存的能量消耗，并统计PDR
+        # 这是最关键的一步，调用我们刚刚重命名的函数
+        self._apply_energy_consumption()
+
+        # 阶段 4: 更新并记录本轮的性能指标
+        # 我们可以继续使用父类的这个通用日志记录函数
+        self._update_and_log_performance_metrics()
+        
+        logger.info(f"--- 第 {self.current_round} 轮结束 (DEEC模式) ---")
+        
+        # 检查仿真是否应结束
+        if self.get_alive_nodes() == 0:
+            logger.info("DEEC网络中所有节点均已死亡，仿真结束。")
+            return False
+            
+        return True

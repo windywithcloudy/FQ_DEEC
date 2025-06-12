@@ -1,4 +1,4 @@
-# config/config.yml 基础配置（前两周聚焦）
+# config/config.yml 基础配置
 
 # 网络拓扑参数
 network:
@@ -6,7 +6,8 @@ network:
   area_size: [500, 500]     # 网络区域尺寸(米)
   base_position: [250,250]  # 基站坐标
   seed: 42                  # 随机种子
-  "communication_range": 130 # 从配置读取或默认
+  communication_range: 150 # 从配置读取或默认
+  ch_range_enhancement_factor: 1.25 
   direct_bs_comm_threshold: 75 # 节点可直连BS的距离阈值 (m)
   poisson_disk_min_dist_factor: 0.65 # 用于计算最小距离的启发式因子 C (r = sqrt((area * C) / N))
                                      # 如果注释掉或未提供，env.py 中会使用默认值
@@ -30,7 +31,7 @@ energy:
   
 # 仿真控制
 simulation:
-  total_rounds: 100      # 总仿真轮数
+  total_rounds: 5000      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
   max_packet_hops: 10       #最大跳数
@@ -70,10 +71,6 @@ deec:
   location_factor_enabled: true     # 启用位置因子
   edge_penalty_factor: 0.3          # 边缘节点惩罚因子
   epoch_length: 20
-  ch_communication_range_base: 100 # CH的基础通信范围 (可以与普通节点不同，或相同)
-  ch_communication_range_max: 200  # CH允许的最大通信范围 (m)
-  ch_communication_range_steps: 4
-  ch_communication_range_increment: 25
   msl: 
       min_ch_count_absolute: 3
       min_ch_ratio_to_alive: 0.05
@@ -131,7 +128,8 @@ q_learning:
   geography_reward_factor: 0.05    # 地理进展奖励的权重
   shortest_path_reward_factor: 10.0 # 全局最短路径奖励的权重
   load_penalty_factor: 20.0 # 负载惩罚的系数，值越大，CH越厌恶拥挤的下一跳
-  dynamic_path_reward_factor: 50.0 # 新的路径奖励因子
+  dynamic_path_reward_factor: 10.0 # 新的路径奖励因子
+  congestion_penalty_factor: 5.0
   ch_management: # 或者放在 deec: 下
     enable_capacity_limit: true       # 是否启用CH容量限制
     max_members_factor: 1.5           # CH最大成员数 = (网络平均每CH成员数) * max_members_factor
@@ -153,7 +151,7 @@ rewards:
     distance_impact_unit: 5.0 # w_dis 影响的基础奖励/惩罚幅度
     select_ch: # 普通节点选择CH的奖励组件基础值
     transmission_success: 50.0
-    transmission_fail: -50.0
+    routing_failure_penalty: -50.0
     energy_component_scale: 20.0  # 用于缩放CH能量项的贡献
     path_component_scale: 30.0    # 用于缩放路径成本/成功率项的贡献
     load_component_scale: 20.0    # 用于缩放CH负载项的贡献
@@ -171,6 +169,7 @@ rewards:
 
   select_ch:
     rejection_penalty: -30.0        # 当选择的CH因容量满而拒绝加入时的惩罚
+    energy_cost_penalty_factor: 50000
 
 discretization_params:
   energy: # 归一化能量
@@ -194,19 +193,19 @@ discretization_params:
     boundaries: [0, 2, 4] # =0, =1 or =2, >2
 
   distance_to_bs_normalized:
-    boundaries: [0.22, 0.35, 0.48] 
+    boundaries: [0.2, 0.4, 0.6, 0.8]
 
 routing:
   dynamic_cost_weights:
-    distance: 0.2  # 距离成本的权重
+    distance: 0.15  # 距离成本的权重
     energy: 0.4    # 能量成本的权重
-    load: 0.4      # 负载成本的权重
+    load: 0.45      # 负载成本的权重
     direct_bs_factor: 1.5 # [新增] 直连BS的成本惩罚因子
     gateway_hop_discount: 0.7 # [新增] 去往网关CH的路由成本折扣因子。小于1表示鼓励。
-    relay_hop_discount: 0.85  # [新增] 去往常规中继CH的成本折扣
+    relay_hop_discount: 0.9  # [新增] 去往常规中继CH的成本折扣
 
 # in config.yml
 pre_training:
-  enabled: false
+  enabled: true
   rounds_compete_ch: 50000
   rounds_select_ch: 20000

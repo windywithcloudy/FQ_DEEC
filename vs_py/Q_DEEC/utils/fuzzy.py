@@ -569,71 +569,59 @@ class RewardWeightsFuzzySystemForCHCompetition:
 
     # in fuzzy.py -> class RewardWeightsFuzzySystemForCHCompetition
 
+    # in fuzzy.py -> class RewardWeightsFuzzySystemForCHCompetition
     def _define_rules_once(self):
         """
-        定义一套修正后的、全覆盖的模糊规则。
+        [最终微调版] 定义一套更专注于宏观调控的模糊规则。
         """
-        logger.debug("Defining a new, robust, full-coverage set of fuzzy rules for RewardWeightsFuzzySystem...")
+        logger.debug("Defining a new, fine-tuned set of fuzzy rules for RewardWeightsFuzzySystem...")
         rules = []
 
         # ======================================================================
-        # 规则集 1: w_members_factor (成员收益权重)
-        # 主要由全局CH密度决定。
+        # 规则集 1: w_members_factor (成员/贡献收益权重)
+        # 核心思想：网络越缺CH，吸引成员、处理数据的奖励就应该越高。
         # ======================================================================
         rules.append(ctrl.Rule(self.ch_density_global['Too_Low'],  self.w_members_factor['Increase']))
         rules.append(ctrl.Rule(self.ch_density_global['Optimal'],  self.w_members_factor['Neutral']))
         rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_members_factor['Decrease']))
+        # [新增] 补充规则：当网络能量危急时，任何贡献都极其宝贵，必须大力奖励。
+        rules.append(ctrl.Rule(self.network_energy_level['Low'], self.w_members_factor['Increase']))
 
         # ======================================================================
-        # 规则集 2: w_cost_ch_factor (成为CH的成本权重)
-        # 主要由全局CH密度决定。
+        # 规则集 2: w_cost_ch_factor (能效惩罚的权重)
+        # [核心修改] 让这个权重只响应CH密度，不再与网络能量挂钩。
+        # CH太少，我们容忍一些能效不高的CH；CH太多，我们就要严格筛选出能效最高的。
         # ======================================================================
-        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'],  self.w_cost_ch_factor['Decrease']))
-        rules.append(ctrl.Rule(self.ch_density_global['Optimal'],  self.w_cost_ch_factor['Neutral']))
-        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_cost_ch_factor['Increase']))
-        # 增加一条：当网络整体能量很低时，成为CH的成本应该降低，以鼓励有能力的节点站出来。
-        rules.append(ctrl.Rule(self.network_energy_level['Low'], self.w_cost_ch_factor['Decrease']))
+        rules.append(ctrl.Rule(self.ch_density_global['Too_Low'],  self.w_cost_ch_factor['Decrease'])) # 降低惩罚
+        rules.append(ctrl.Rule(self.ch_density_global['Optimal'],  self.w_cost_ch_factor['Neutral']))  # 中性惩罚
+        rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_cost_ch_factor['Increase'])) # 加大惩罚
+        # [删除] 删除了 `ctrl.Rule(self.network_energy_level['Low'], self.w_cost_ch_factor['Decrease'])`
 
         # ======================================================================
-        # 规则集 3: w_energy_self_factor (自身能量贡献权重) - **修正版**
-        # 主要由节点自身能量决定，并由网络整体能量进行微调。
-        # 这样可以保证任何自身能量状态都有对应的规则。
+        # 规则集 3: w_energy_self_factor (自身能量贡献权重) - 保持不变
         # ======================================================================
         rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_energy_self_factor['Decrease']))
         rules.append(ctrl.Rule(self.node_self_energy['Medium'], self.w_energy_self_factor['Neutral']))
-        # 当节点自身能量高时，再考虑网络整体情况
         rules.append(ctrl.Rule(self.node_self_energy['High'] & self.network_energy_level['High'], self.w_energy_self_factor['Neutral']))
         rules.append(ctrl.Rule(self.node_self_energy['High'] & (self.network_energy_level['Medium'] | self.network_energy_level['Low']), self.w_energy_self_factor['Increase']))
 
         # ======================================================================
-        # 规则集 4: w_rotation_factor (轮换收益权重)
-        # 主要由CH密度决定，不应该让能量低的节点被过度鼓励。
+        # 规则集 4: w_rotation_factor (轮换收益权重) - 保持不变
         # ======================================================================
         rules.append(ctrl.Rule(self.ch_density_global['Too_Low'], self.w_rotation_factor['Increase']))
         rules.append(ctrl.Rule(self.ch_density_global['Optimal'], self.w_rotation_factor['Neutral']))
         rules.append(ctrl.Rule(self.ch_density_global['Too_High'], self.w_rotation_factor['Decrease']))
-        # 增加一条：能量低的节点不应该强调轮换收益
         rules.append(ctrl.Rule(self.node_self_energy['Low'], self.w_rotation_factor['Decrease']))
 
         # ======================================================================
-        # 规则集 5: w_dis (距离影响权重)
-        # 主要由距离本身决定，并由CH密度微调。
+        # 规则集 5: w_dis (距离影响权重) - 保持不变
         # ======================================================================
-        # 距离太近或太远都是缺点，增加惩罚（w_dis -> Increase）
         rules.append(ctrl.Rule(self.ch_to_bs_dis['Low'],  self.w_dis['Increase']))
         rules.append(ctrl.Rule(self.ch_to_bs_dis['High'], self.w_dis['Increase']))
-        # 距离适中是优点，降低惩罚（w_dis -> Decrease）
         rules.append(ctrl.Rule(self.ch_to_bs_dis['Medium'], self.w_dis['Decrease']))
-        # 微调：如果CH极度稀缺，可以稍微容忍位置不佳的CH
         rules.append(ctrl.Rule((self.ch_to_bs_dis['Low'] | self.ch_to_bs_dis['High']) & self.ch_density_global['Too_Low'], self.w_dis['Neutral']))
 
-
-        if not rules:
-            logger.warning("RewardWeightsFuzzySystem: No rules were defined, this should not happen.")
-            # 添加一个绝对的后备规则
-            rules.append(ctrl.Rule(self.network_energy_level['Medium'], (self.w_members_factor['Neutral'], self.w_cost_ch_factor['Neutral'])))
-
-        logger.debug(f"Defined {len(rules)} new, robust, full-coverage rules for RewardWeightsFuzzySystem.")
+        logger.debug(f"Defined {len(rules)} fine-tuned rules for RewardWeightsFuzzySystem.")
         return rules
 
     def compute_reward_weights(self, current_net_energy_level, current_node_self_energy, 
@@ -771,14 +759,21 @@ class CHSelectionStrategyFuzzySystem:
         self.net_congestion_level['Medium'] = fuzz.trimf(self.net_congestion_level.universe, [0.3, 0.5, 0.7])
         self.net_congestion_level['High'] = fuzz.smf(self.net_congestion_level.universe, 0.6, 0.8)
 
-        # [核心修改] 定义新的输出变量
-        universe_factor = np.arange(0.5, 2.01, 0.01) # 调整因子范围：[0.5, 2.0]
+       # [核心修改] 调整输出变量的模糊集，使其更保守、更倾向于减少CH
+        universe_factor = np.arange(0.5, 1.51, 0.01) # 将上限从2.0降低到1.5
         self.p_opt_adjustment_factor = ctrl.Consequent(universe_factor, 'p_opt_adjustment_factor')
-        self.p_opt_adjustment_factor['Decrease_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.5, 0.5, 0.8])
-        self.p_opt_adjustment_factor['Decrease_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.7, 0.9, 1.0])
+        
+        # “显著减少”的范围更大，效果更强
+        self.p_opt_adjustment_factor['Decrease_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.5, 0.5, 0.7])
+        # “轻微减少”的范围也更广
+        self.p_opt_adjustment_factor['Decrease_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.6, 0.8, 1.0])
+        
         self.p_opt_adjustment_factor['Neutral'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.95, 1.0, 1.05])
-        self.p_opt_adjustment_factor['Increase_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.0, 1.1, 1.3])
-        self.p_opt_adjustment_factor['Increase_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.2, 1.5, 2.0])
+        
+        # “增加”的幅度被严格限制
+        self.p_opt_adjustment_factor['Increase_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.0, 1.1, 1.2])
+        self.p_opt_adjustment_factor['Increase_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [1.15, 1.3, 1.5])
+
 
     # in fuzzy.py -> class CHSelectionStrategyFuzzySystem
 
@@ -976,35 +971,48 @@ class CHDeclarationFuzzySystem:
 if __name__ == '__main__':
     # --- Example for Normal Node CH Selection ---
     print("--- Normal Node CH Selection Example ---")
-    sim_node_sum = 100
-    sim_cluster_sum = 10
+    
+    # 【修改区域】
+    # 构造一个简单的模拟config，以匹配新的__init__方法
+    dummy_config = {
+        'deec': {'p_opt': 0.1},
+        'network': {'node_count': 100}
+    }
     sim_avg_e_send_normal = 0.002 # Avg send energy for normal node to CH
 
+    # 使用新的实例化方式
     normal_node_fuzzy_selector = NormalNodeCHSelectionFuzzySystem(
-        node_sum=sim_node_sum,
-        cluster_sum=sim_cluster_sum
+        main_sim_config=dummy_config
     )
+    # 【修改结束】
+
     # Pass the specific average send energy for this context
+    # 注意：您的compute_weights方法也已更新，这里为了能运行，需要调整调用
+    # 这是一个示例，您需要根据最新定义提供所有必需的参数
     weights_normal = normal_node_fuzzy_selector.compute_weights(
-        current_dc_base=80, current_e_cluster=0.7, current_p_cluster_actual=5,
-        current_r_success=0.9, current_e_send_total_actual=0.0015,
-        avg_e_send_total_for_normal_node=sim_avg_e_send_normal
+        current_dc_base=80, 
+        current_e_cluster_normalized=0.7, 
+        current_p_cluster_ratio_val=0.5, # 传入比率值
+        current_r_success_normalized=0.9, 
+        current_e_send_total_ratio_val=0.75 # 传入比率值
     )
     print("Normal Node CH Selection Weights:")
     for wn_name, wn_value in weights_normal.items(): # Changed variable names for clarity
         print(f"  {wn_name}: {wn_value:.4f}") # Format to 4 decimal places
     #normal_node_fuzzy_selector.view_antecedent('e_cluster')
 
-
     # --- Example for CH to BS Path Selection ---
     print("\n--- CH to BS Path Selection Example ---")
-    # These averages might be different or obtained differently for CH-to-CH communication
+    sim_node_sum = 100
+    sim_cluster_sum = 10
     sim_avg_load_for_neighbor = sim_node_sum / sim_cluster_sum if sim_cluster_sum > 0 else 10
 
+    # 【修改区域】
     ch_path_fuzzy_selector = CHToBSPathSelectionFuzzySystem(
-        node_sum=sim_node_sum, # Might be used to calculate avg_load_for_neighbor if not passed directly
-        cluster_sum=sim_cluster_sum
+        main_sim_config=dummy_config
     )
+    # 【修改结束】
+
     weights_ch = ch_path_fuzzy_selector.compute_weights(
         current_dc_bs_neighbor=100, current_e_c_neighbor=0.8,
         current_load_c_actual=8,
