@@ -82,9 +82,13 @@ deec:
     energy_weight: 0.3
     centrality_weight: 0.2
     suppression_factor: 0.5 # [新增] 拓扑抑制衰减因子。0.5表示邻居的候选度减半
-  # E_avg_current: 1.0      # 当前网络平均能量 (这个通常是动态计算的，但可以有个初始估计或不用配置)
-  # round_length_epoch: 100 # 一个epoch包含的轮数 (DEEC中簇头通常在一个epoch内不变)
-                           # 对于初步集成，我们可以简化为每轮都可能重新选举
+  ch_election:
+    # 中继区（靠近BS的区域）的CH目标比例
+    p_opt_relay: 0.15
+    # 接入区（远离BS的区域）的CH目标比例
+    p_opt_access: 0.08
+    # 拓扑抑制因子（用于接入区选举）
+    suppression_factor: 0.5
 
 # A-IoT特性增强参数
 aiot_enhancements:
@@ -130,12 +134,15 @@ q_learning:
   load_penalty_factor: 20.0 # 负载惩罚的系数，值越大，CH越厌恶拥挤的下一跳
   dynamic_path_reward_factor: 10.0 # 新的路径奖励因子
   congestion_penalty_factor: 5.0
+  reputation_threshold: 0.5
+  reputation_penalty_weight: 0.5
   ch_management: # 或者放在 deec: 下
     enable_capacity_limit: true       # 是否启用CH容量限制
     max_members_factor: 1.5           # CH最大成员数 = (网络平均每CH成员数) * max_members_factor
     overload_tolerance: 2
     max_energy_budget_per_round_for_tx: 0.1 # CH每轮最多使用其当前能量的10%用于发送
     max_packets_per_round_absolute: 5      # CH每轮最多发送的绝对数据包数量上限
+    min_members_threshold: 3 # CH的最低成员数要求（不含自己）。设为0表示只处理光杆司令。可以设为3或5。
   # 可以为普通节点选择CH的Q学习也添加类似参数
 
 rewards:
@@ -209,3 +216,8 @@ pre_training:
   enabled: true
   rounds_compete_ch: 50000
   rounds_select_ch: 20000
+
+
+heed:
+  p_min: 0.0001           # 最小簇头概率，防止高能节点永远当选
+  max_iterations: 20      # 选举过程的最大迭代次数，防止死循环

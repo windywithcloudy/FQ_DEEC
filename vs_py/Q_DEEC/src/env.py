@@ -194,6 +194,8 @@ class WSNEnv:
         self.ch_switching_hysteresis = float(q_learning_cfg.get('ch_switching_hysteresis', 5.0)) # 新增：切换滞后阈值
         ch_management_cfg = q_learning_cfg.get('ch_management', {}) # 或者 self.config.get('deec', {})
         self.enable_ch_capacity_limit = ch_management_cfg.get('enable_capacity_limit', True)
+        self.enable_ch_disqualification = ch_management_cfg.get('enable_ch_disqualification', True)
+        self.ch_min_members_threshold = int(ch_management_cfg.get('min_members_threshold', 3)) # 默认只处理光杆司令
         self.ch_max_members_factor = float(ch_management_cfg.get('max_members_factor', 1.5))
         rewards_cfg = self.config.get('rewards', {}).get('select_ch', {})
         self.ch_rejection_penalty = float(rewards_cfg.get('rejection_penalty', -30.0))
@@ -496,26 +498,7 @@ class WSNEnv:
         if raw_state is None: return 0.0
 
         # --- 步骤 1: 获取模糊逻辑的动态权重 (这部分逻辑不变) ---
-        current_total_energy = sum(n['energy'] for n in self.nodes if n['status'] == 'active')
-        current_total_initial_energy = sum(n['initial_energy'] for n in self.nodes if n['status'] == 'active' and n['initial_energy'] > 0)
-        net_energy_level_normalized = current_total_energy / current_total_initial_energy if current_total_initial_energy > 0 else 0
-        node_self_energy_normalized = raw_state["e_self"]
-        num_alive = self.get_alive_nodes()
-        ch_density_global_val = len(self.confirmed_cluster_heads_for_epoch) / num_alive if num_alive > 0 else 0
-        ch_to_bs_dis_normalized = raw_state["d_bs"] / self.network_diagonal if self.network_diagonal > 0 else 0
-        
-
-        
-        if not hasattr(self, 'reward_weights_adjuster'):
-            from utils.fuzzy import RewardWeightsFuzzySystemForCHCompetition
-            self.reward_weights_adjuster = RewardWeightsFuzzySystemForCHCompetition(self.config)
-        
-        fuzzy_reward_weights = self.reward_weights_adjuster.compute_reward_weights(
-            current_net_energy_level=net_energy_level_normalized,
-            current_node_self_energy=node_self_energy_normalized,
-            current_ch_density_global=ch_density_global_val,
-            current_ch_to_bs_dis_normalized=ch_to_bs_dis_normalized
-        )
+        fuzzy_reward_weights = self._get_fuzzy_ch_competition_reward_weights(node_id, raw_state)
 
         # --- 步骤 2: 定义所有奖励/惩罚的基础单位值 (从config加载) ---
         reward_cfg = self.config.get('rewards', {}).get('ch_competition', {}) # 使用 ch_competition 键
@@ -1247,11 +1230,9 @@ class WSNEnv:
 
         # 阶段 2: 普通节点选择簇头
         self._run_normal_node_selection_phase()
-        
-        # 阶段 2.5: CH 容量限制与协调
-        if self.enable_ch_capacity_limit:
-            self._run_ch_capacity_check_phase()
-        self._remedy_isolated_nodes() # 新增调用
+
+        self._run_ch_disqualification_and_remedy_phase()
+
         # 阶段 3: CH 选择下一跳进行路由
         self._run_ch_routing_phase()
 
@@ -1277,8 +1258,6 @@ class WSNEnv:
             
         return True
 
-
-    # in env.py
     def _prepare_for_new_round(self):
         """
         [最终修复版] 阶段 0: 为新一轮仿真做准备。
@@ -1346,384 +1325,54 @@ class WSNEnv:
             self._update_select_ch_q_tables()
         self.confirmed_cluster_heads_previous_epoch = list(self.confirmed_cluster_heads_for_epoch)
 
-        # --- [核心修改] 三阶段选举流程 ---
+        # --- [核心重构] 简化的三步流程 ---
 
-        # 阶段 1: 初选 (基于分区差异化策略)
-        logger.info("选举阶段1：执行分区差异化初选...")
-        gateway_ch_ids = self.promote_gateway_chs()
-        initial_regular_chs = self._elect_regular_chs(gateway_ch_ids)
+        # 步骤一: 选举一个分布合理的CH集合
+        # 我们不再区分中继/接入，而是直接选举一个总数确定、分布均匀的CH集合。
+        logger.info("选举阶段：执行全局拓扑抑制选举...")
+        self.confirmed_cluster_heads_for_epoch = self._elect_chs_with_global_suppression()
         
-        # 初步的CH集合，用于连通性诊断
-        preliminary_ch_set = set(gateway_ch_ids + initial_regular_chs)
-        logger.info(f"初选完成，产生 {len(preliminary_ch_set)} 个初步CH。")
-
-        # 阶段 2: 连通性诊断与桥接 (确保所有CH都能接入骨干网)
-        logger.info("选举阶段2：诊断连通性并增选桥接CH...")
-        # [新增] 调用新的辅助函数
-        bridge_chs, final_ch_set = self._ensure_ch_connectivity(preliminary_ch_set)
-        if bridge_chs:
-            logger.info(f"为保证连通性，已增选 {len(bridge_chs)} 个桥接CH: {bridge_chs}")
-
-        # 阶段 3: 最终确认与角色更新
-        logger.info("选举阶段3：最终确认CH列表并更新角色...")
-        self.gateway_chs_for_epoch = gateway_ch_ids
-        # 常规CH = 初始选的 + 桥接的
-        self.regular_chs_for_epoch = list(set(initial_regular_chs + bridge_chs))
-        self.confirmed_cluster_heads_for_epoch = list(final_ch_set)
-
-        # 为所有最终的CH更新角色和通信范围
+        # 赋予CH角色
         self._update_node_roles_and_timers(self.confirmed_cluster_heads_for_epoch)
+        logger.info(f"选举完成，共产生 {len(self.confirmed_cluster_heads_for_epoch)} 个CH。")
 
-        logger.info(f"本Epoch最终CH列表确认: {len(self.confirmed_cluster_heads_for_epoch)}个 "
-                    f"({len(self.gateway_chs_for_epoch)}个网关, {len(self.regular_chs_for_epoch) - len(bridge_chs)}个常规, {len(bridge_chs)}个桥接).")
-
-    def _elect_regular_chs(self, gateway_ch_ids):
-        """
-        [V11.0 最终版] 采用“分区差异化选举策略”，结合宏观调控和拓扑抑制。
-        """
-        # 1. 确定总选举池和合格节点数
-        # ... (这部分代码不变) ...
-        nodes_for_election = [
-            n for n in self.nodes 
-            if n["status"] == "active" and not n.get("is_gateway_ch", False)
-        ]
-        if not nodes_for_election:
-            return []
-        num_alive_eligible = len(nodes_for_election)
-
-        # 2. [宏观调控] 计算本轮总体的 p_opt_current
-        # ... (这部分代码不变) ...
-        # ... (得到 total_ideal_ch_count) ...
-        pdr_ma = self.get_pdr_moving_average()
-        avg_energy_norm = self._calculate_current_average_energy() / self.E0
-        isolated_rate = getattr(self, 'isolated_node_rate_last_epoch', 0.0)
-        congestion = getattr(self, 'congestion_level_last_epoch', 0.0)
-
-        adjustment_factor = self.strategy_fuzzy_logic.compute_p_opt_factor(
-            pdr=pdr_ma,
-            energy=avg_energy_norm,
-            isolated_rate=isolated_rate,
-            congestion=congestion
-        )
-        
-        self.p_opt_current = self.p_opt_initial * adjustment_factor
-        
-        p_opt_min_cap = self.config.get('deec', {}).get('p_opt_min_cap', 0.03)
-        p_opt_max_cap = self.config.get('deec', {}).get('p_opt_max_cap', 0.25)
-        self.p_opt_current = np.clip(self.p_opt_current, p_opt_min_cap, p_opt_max_cap)
-        
-        logger.info(f"高阶模糊策略决策 -> 最终 p_opt_current={self.p_opt_current:.3f}")
-        total_ideal_ch_count = int(num_alive_eligible * self.p_opt_current)
-
-
-        # 3. [分区] 将所有候选节点划分到四个象限
-        # ... (这部分代码不变) ...
-        center_x = self.config['network']['area_size'][0] / 2
-        center_y = self.config['network']['area_size'][1] / 2
-        quadrants = {
-            'top_right': [], 'top_left': [],
-            'bottom_right': [], 'bottom_left': []
-        }
-        for node in nodes_for_election:
-            x, y = node['position']
-            if x >= center_x and y >= center_y:
-                quadrants['top_right'].append(node)
-            elif x < center_x and y >= center_y:
-                quadrants['top_left'].append(node)
-            elif x >= center_x and y < center_y:
-                quadrants['bottom_right'].append(node)
-            else:
-                quadrants['bottom_left'].append(node)
-
-        # 4. [分区差异化选举]
-        final_regular_chs = []
-        suppression_factor = self.config.get('deec', {}).get('ch_election', {}).get('suppression_factor', 0.5)
-        
-        # 定义中心区域的边界，例如占整个区域的40%
-        relay_zone_radius_sq = (self.network_diagonal * 0.4)**2 
-
-        for quadrant_name, nodes_in_quadrant in quadrants.items():
-            if not nodes_in_quadrant:
-                continue
-
-            num_nodes_in_quadrant = len(nodes_in_quadrant)
-            
-            # a. 计算本区域的弹性配额
-            quadrant_node_ratio = num_nodes_in_quadrant / num_alive_eligible if num_alive_eligible > 0 else 0
-            ideal_ch_count_for_quadrant = round(total_ideal_ch_count * quadrant_node_ratio)
-            
-            # b. [核心修改] 在本区域内，根据节点位置采用不同评分标准
-            candidate_scores_in_quadrant = {}
-            ideal_members = 1 / self.p_opt_current if self.p_opt_current > 0 else 10
-            
-            for node in nodes_in_quadrant:
-                node_id = node["id"]
-                state_tuple = self.get_discrete_state_tuple_for_competition(node_id)
-                if state_tuple is None: continue
-                
-                q0, q1 = self.get_q_value_compete_ch(node_id, state_tuple, 0), self.get_q_value_compete_ch(node_id, state_tuple, 1)
-                q_advantage = q1 - q0
-                energy_score = node["energy"] / node["initial_energy"]
-                
-                # 判断节点属于哪个区域
-                dist_to_bs_sq = self.calculate_distance_to_base_station(node_id)**2
-
-                if dist_to_bs_sq <= relay_zone_radius_sq:
-                    # --- 中继区 (Relay Zone) 选举标准 ---
-                    # 目标：选出强大的骨干路由器
-                    # 优先考虑：1. 离BS近  2. 能量高
-                    
-                    # 1. 距离评分 (越近越好)
-                    distance_score = 1.0 - (math.sqrt(dist_to_bs_sq) / (self.network_diagonal * 0.4))
-                    
-                    # 最终评分：距离(50%) + 能量(40%) + Q学习(10%)
-                    score = (0.5 * distance_score) + (0.4 * energy_score) + (0.1 * q_advantage)
-
-                else:
-                    # --- 接入区 (Access Zone) 选举标准 ---
-                    # 目标：选出优秀的社区服务中心
-                    # 优先考虑：1. 覆盖潜力  2. 能量充足
-                    
-                    # 1. 覆盖潜力评分 (有足够邻居来形成簇)
-                    neighbor_count = len(self.get_node_neighbors(node_id, node["base_communication_range"]))
-                    coverage_potential = min(neighbor_count, ideal_members) / (ideal_members + 1e-6)
-                    
-                    # 最终评分：覆盖潜力(50%) + 能量(40%) + Q学习(10%)
-                    score = (0.5 * coverage_potential) + (0.4 * energy_score) + (0.1 * q_advantage)
-                
-                candidate_scores_in_quadrant[node_id] = score
-            
-            if not candidate_scores_in_quadrant: continue
-
-            # c. 在本区域内进行拓扑抑制选举 (这部分逻辑不变)
-            chs_in_quadrant = []
-            potential_candidates_in_quadrant = dict(candidate_scores_in_quadrant)
-            while len(chs_in_quadrant) < ideal_ch_count_for_quadrant and potential_candidates_in_quadrant:
-                best_candidate_id = max(potential_candidates_in_quadrant, key=lambda k: potential_candidates_in_quadrant[k])
-                chs_in_quadrant.append(best_candidate_id)
-                del potential_candidates_in_quadrant[best_candidate_id]
-                
-                neighbors_to_suppress = self.get_node_neighbors(best_candidate_id, self.nodes[best_candidate_id]["base_communication_range"])
-                for neighbor_id in neighbors_to_suppress:
-                    if neighbor_id in potential_candidates_in_quadrant:
-                        potential_candidates_in_quadrant[neighbor_id] *= suppression_factor
-            
-            # d. 最低配额保障 (MSL for Quadrant) (这部分逻辑不变)
-            if not chs_in_quadrant and nodes_in_quadrant: # 确保分区内有节点才触发
-                best_in_quadrant = max(candidate_scores_in_quadrant, key=lambda k: candidate_scores_in_quadrant[k])
-                chs_in_quadrant.append(best_in_quadrant)
-                logger.warning(f"分区配额保障触发：为区域 {quadrant_name} 强制增补了CH {best_in_quadrant}。")
-                
-            final_regular_chs.extend(chs_in_quadrant)
-
-        return final_regular_chs
 
     def _run_normal_node_selection_phase(self):
         """
-        [V12.0 最终版] 普通节点决策并记录CH选择。
-        该版本引入了“能耗感知”决策，即在Q值的基础上，惩罚连接成本高的CH，
-        以避免节点为连接一个遥远的“好”CH而耗尽自身能量。
-        """        
-        logger.info("开始阶段2：普通节点进行CH关联决策...")
+        [V-Final 8.0] 关联阶段：所有普通节点无条件地连接到离自己最近的、可达的CH。
+        """
+        logger.info("关联阶段：所有普通节点连接到最近的CH...")
         
-        # 1. 安全性检查：确保有常规CH可供选择
-        if not hasattr(self, 'regular_chs_for_epoch') or not self.regular_chs_for_epoch:
-            logger.warning("没有任何常规CH可供选择 (self.regular_chs_for_epoch为空)，所有普通节点将尝试补救或保持孤立。")
-            # 确保所有普通节点的cluster_id都是-1，以便后续补救
+        num_assigned = 0
+        num_isolated = 0
+
+        if not self.confirmed_cluster_heads_for_epoch:
+            logger.warning("没有任何CH可选，所有普通节点将保持孤立。")
             for node_data in self.nodes:
-                if node_data["role"] == "normal":
-                    node_data["cluster_id"] = -1
+                if node_data['status'] == 'active' and node_data['role'] == 'normal':
+                    node_data['cluster_id'] = -1
             return
 
-        num_nodes_switched = 0
-        num_nodes_newly_assigned = 0
-        relay_zone_radius = self.network_diagonal * 0.4
-
-        # 从config获取能耗惩罚的权重
-        # 如果config中没有，则默认为0，即不启用能耗惩罚
-        energy_cost_penalty_factor = self.config.get('rewards', {}).get('select_ch', {}).get('energy_cost_penalty_factor', 0)
-        if energy_cost_penalty_factor > 0:
-            logger.debug(f"本轮普通节点选择CH时，启用能耗惩罚，因子为: {energy_cost_penalty_factor}")
-
         for node_data in self.nodes:
-            # 只处理活跃的、未分配角色的普通节点
-            if not (node_data["status"] == "active" and node_data["role"] == "normal"):
-                continue
-
-            node_id = node_data["id"]
-            previous_ch_id = node_data.get("cluster_id", -1) # 使用.get()更安全
-            
-            # 2. 寻找并分类可达的常规CH
-            reachable_access_chs = []
-            reachable_relay_chs = []
-            
-            # 使用节点的当前通信范围进行判断
-            node_comm_range = node_data.get("current_communication_range", node_data["base_communication_range"])
-
-            for ch_id in self.regular_chs_for_epoch:
-                # 确保CH是活跃的
-                if self.nodes[ch_id]["status"] == "active":
-                    dist = self.calculate_distance(node_id, ch_id)
-                    if dist <= node_comm_range:
-                        if self.calculate_distance_to_base_station(ch_id) <= relay_zone_radius:
-                            reachable_relay_chs.append(ch_id)
-                        else:
-                            reachable_access_chs.append(ch_id)
-            
-            # 3. 根据“接入优先”原则确定最终候选池
-            candidate_ch_ids = []
-            if reachable_access_chs:
-                candidate_ch_ids = reachable_access_chs
-            elif reachable_relay_chs:
-                logger.debug(f"节点 {node_id} 找不到接入CH，尝试连接中继CH。")
-                candidate_ch_ids = reachable_relay_chs
-            
-            # 4. 如果没有候选者，则标记为孤立，等待补救
-            if not candidate_ch_ids:
-                node_data["cluster_id"] = -1
-                node_data["last_epoch_choice"] = {'ch_id': -1, 'is_successful': False}
-                continue
-
-            # 5. [核心] 在候选池中进行“能耗感知”的Q学习决策
-            decision_scores = {}
-            for ch_id in candidate_ch_ids:
-                # a. 获取Q学习的长期价值
-                q_value = self.get_q_value_select_ch(node_id, ch_id)
+            if node_data['status'] == 'active' and node_data['role'] == 'normal':
+                min_dist = float('inf')
+                assigned_ch_id = -1
                 
-                # b. 计算连接到这个CH的短期能耗成本
-                dist_to_ch = self.calculate_distance(node_id, ch_id)
-                # 使用配置中的包大小
-                packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
-                estimated_tx_energy = self.calculate_transmission_energy(dist_to_ch, packet_size)
+                for ch_id in self.confirmed_cluster_heads_for_epoch:
+                    if self.nodes[ch_id]['status'] == 'active':
+                        dist = self.calculate_distance(node_data['id'], ch_id)
+                        if dist < min_dist and dist <= node_data['base_communication_range']:
+                            min_dist = dist
+                            assigned_ch_id = ch_id
                 
-                # c. 计算能耗惩罚
-                energy_penalty = estimated_tx_energy * energy_cost_penalty_factor
-                
-                # d. 最终决策分数 = Q学习价值 - 能耗惩罚
-                final_score = q_value - energy_penalty
-                decision_scores[ch_id] = final_score
-
-            # 6. 考虑CH过载惩罚
-            overload_penalty = self.config.get('rewards', {}).get('select_ch', {}).get('overload_penalty', -100.0)
-            for ch_id in candidate_ch_ids:
-                if self.nodes[ch_id].get("is_overloaded", False):
-                    # 直接施加一个巨大的惩罚，使节点极力避免选择过载的CH
-                    decision_scores[ch_id] += overload_penalty 
-
-            # 7. Epsilon-Greedy 决策
-            chosen_ch_id = -1
-            epsilon = node_data.get("epsilon_select_ch", 0.3)
-            if random.random() < epsilon:
-                chosen_ch_id = random.choice(candidate_ch_ids)
-                logger.debug(f"节点 {node_id} (epsilon={epsilon:.2f}) 随机探索，选择了CH {chosen_ch_id}")
-            else:
-                # 基于新的、考虑了能耗和过载的决策分数来选择
-                chosen_ch_id = max(decision_scores, key=lambda k: decision_scores[k])
-                logger.debug(f"节点 {node_id} (epsilon={epsilon:.2f}) 利用价值，选择了CH {chosen_ch_id} (最高分: {decision_scores[chosen_ch_id]:.3f})")
-
-            # 8. 更新本轮状态并记录决策
-            node_data["cluster_id"] = chosen_ch_id
-            node_data["last_epoch_choice"] = {
-                'ch_id': chosen_ch_id,
-                'is_successful': True # 先乐观地假设成功，在epoch结束时根据真实结果更新Q表
-            }
-
-            # 9. 统计切换情况
-            if chosen_ch_id != previous_ch_id:
-                if previous_ch_id == -1:
-                    num_nodes_newly_assigned += 1
+                node_data['cluster_id'] = assigned_ch_id
+                if assigned_ch_id != -1:
+                    num_assigned += 1
                 else:
-                    num_nodes_switched += 1
-
-        logger.info(f"CH关联决策完成：{num_nodes_newly_assigned} 个节点初次分配，{num_nodes_switched} 个节点切换了CH。")
+                    num_isolated += 1
         
-    def _run_ch_capacity_check_phase(self):
-        """阶段 2.5: 检查并处理 CH 容量超限的问题。"""
-        logger.info("开始阶段 2.5：CH 容量限制检查...")
-        if not self.enable_ch_capacity_limit and self.confirmed_cluster_heads_for_epoch:return
-        num_rejections_this_round = 0
-
-        overload_tolerance = self.config.get('q_learning', {}).get('ch_management', {}).get('overload_tolerance', 2)
-        # 计算网络平均每个CH应服务的成员数 (参考值)
-        num_alive_non_direct_bs_nodes = len([
-            n for n in self.nodes
-            if n["status"] == "active" and not n.get("can_connect_bs_directly", False) and n["role"] == "normal"
-        ])
-        num_active_chs_for_capacity = len(self.confirmed_cluster_heads_for_epoch)
+        logger.info(f"节点关联完成：{num_assigned} 个节点被成功分配，{num_isolated} 个节点暂时孤立。")
         
-        if num_active_chs_for_capacity > 0:
-            avg_members_per_ch_ideal = num_alive_non_direct_bs_nodes / num_active_chs_for_capacity
-            # 使用 factor 计算最大成员数
-            max_members_for_ch_calculated = max(1, int(avg_members_per_ch_ideal * self.ch_max_members_factor))
-            # 如果使用绝对值，则是:
-            # max_members_for_ch_calculated = self.ch_max_absolute_members
-            logger.debug(f"  CH容量限制：理想平均成员数={avg_members_per_ch_ideal:.2f}, 计算得到的最大成员数上限={max_members_for_ch_calculated}")
-        else:
-            # 没有活跃CH，无法进行容量限制，或设置一个默认上限（如果普通节点依然选了某些ID）
-            max_members_for_ch_calculated = 10 # 任意默认值，理论上不应发生
-        
-        rejection_threshold = max_members_for_ch_calculated + overload_tolerance
-
-        for ch_id in self.confirmed_cluster_heads_for_epoch:
-            ch_node_data = self.nodes[ch_id] # 使用不同变量名
-            if ch_node_data["status"] != "active" or ch_node_data["role"] != "cluster_head":
-                continue
-
-            # 找出所有选择了这个CH的普通节点
-            current_members_of_ch = [
-                node for node in self.nodes 
-                if node.get("cluster_id") == ch_id and node.get("role") == "normal"
-            ]
-            
-            num_current_members = len(current_members_of_ch)
-            # logger.debug(f"  CH {ch_id} 当前有 {num_current_members} 个成员，容量上限 {max_members_for_ch_calculated}.")
-
-            if num_current_members > max_members_for_ch_calculated:
-            # 标记自己为过载，以便下一轮普通节点可以感知到
-                ch_node_data["is_overloaded"] = True
-                logger.info(f"  CH {ch_id} 过载 (成员数 {num_current_members} > 上限 {max_members_for_ch_calculated})，已广播过载状态。")
-                if num_current_members > max_members_for_ch_calculated:
-                    num_to_reject = num_current_members - max_members_for_ch_calculated
-                    logger.info(f"  CH {ch_id} 过载 (成员数 {num_current_members} > 上限 {max_members_for_ch_calculated})。需要拒绝 {num_to_reject} 个成员。")
-
-                    # 拒绝策略：例如，拒绝距离最远的成员
-                    # 可以先按距离排序，然后拒绝多余的
-                    current_members_of_ch.sort(key=lambda m_node: self.calculate_distance(m_node["id"], ch_id), reverse=True)
-                    
-                    for i_reject in range(num_to_reject): # 使用不同循环变量
-                        if i_reject < len(current_members_of_ch): # 确保列表还有元素
-                            rejected_node = current_members_of_ch[i_reject]
-                            rejected_node_id = rejected_node["id"]
-                            
-                            logger.info(f"    CH {ch_id} 拒绝节点 {rejected_node_id} (距离: {self.calculate_distance(rejected_node_id, ch_id):.2f}m)。")
-                            
-                            # 1. 更新被拒绝节点的 cluster_id
-                            rejected_node["cluster_id"] = -1 # 标记为未分配
-                            
-                            # 2. 更新被拒绝节点对该CH的Q值 (施加惩罚)
-                            #   需要获取被拒绝节点在选择该CH时使用的模糊权重和能耗等信息，
-                            #   或者更简单地，直接更新Q值，惩罚该(CH_ID)动作。
-                            #   这里采用简化的直接Q值惩罚，不重新计算完整奖励。
-                            #   注意：这可能不是最精确的Q学习更新，但作为惩罚机制是可行的。
-                            
-                            # 简化的Q值更新：直接在旧Q值基础上减去惩罚或乘以一个衰减因子
-                            # 或者，如果能拿到当时的fuzzy_weights和消耗，可以重新调用calculate_reward_for_selecting_ch，但结果设为极低
-                            # 最简单：
-                            self.update_q_value_select_ch(rejected_node_id, ch_id, self.ch_rejection_penalty) # 使用配置的惩罚值
-                            if "collected_raw_packets" in ch_node_data and ch_node_data["collected_raw_packets"] > 0:
-                                ch_node_data["collected_raw_packets"] -= 1
-                            
-                            # 将被拒绝节点的数据重新标记为“待发送”
-                            rejected_node["has_data_to_send"] = True
-                            num_rejections_this_round += 1
-                        else:
-                            break # 如果排序后的成员列表已空
-            else:
-                ch_node_data["is_overloaded"] = False # 如果没过载，确保状态是False
-
-        if num_rejections_this_round > 0:
-            logger.info(f"CH容量限制阶段：共拒绝了 {num_rejections_this_round} 个节点的加入请求。")
-
 
     def _run_ch_routing_phase(self):
         """
@@ -1809,7 +1458,7 @@ class WSNEnv:
         
         # 获取一些参考值
         avg_load_for_nh_ref = self.get_alive_nodes() / len(routing_nodes) if routing_nodes else 10
-
+        relay_zone_radius = self.network_diagonal * 0.4 
         for u_id in routing_nodes:
             u_node = self.nodes[u_id]
             if u_node["status"] != "active": continue
@@ -1825,32 +1474,16 @@ class WSNEnv:
                 
                 # 准备模糊输入
                 e_v_norm = v_node["energy"] / v_node["initial_energy"] if v_node["initial_energy"] > 0 else 0
-                load_v_actual = len(self.packets_in_transit.get(nh_id, [])) # 使用实时缓冲区负载
-                r_success_norm = u_node.get("history_success_with_nh", {}).get(nh_id, 0.9) # 假设的历史成功率
-                e_cost_norm = self.calculate_transmission_energy(dist, 4000) / self.calculate_transmission_energy(u_node["current_communication_range"], 4000)
-                
-                fuzzy_weights = self.ch_path_fuzzy_logic.compute_weights(
-                    current_dc_bs_neighbor=self.calculate_distance_to_base_station(nh_id),
-                    current_e_c_neighbor=e_v_norm,
-                    current_load_c_actual=load_v_actual,
-                    current_r_c_success=r_success_norm,
-                    current_e_ctx_cost_normalized=np.clip(e_cost_norm, 0, 1),
-                    avg_load_for_neighbor_ch=avg_load_for_nh_ref
-                )
-                
-                # 将模糊权重转化为一个综合成本值
-                # 成本 = 路径差的权重 + 能耗权重 + 负载权重 + (1 - 可持续性权重)
-                # 我们希望选择权重组合最优的路径
-                cost = fuzzy_weights.get('w_path', 0.5) + \
-                    fuzzy_weights.get('w_e_cost', 0.5) + \
-                    fuzzy_weights.get('w_load_neighbor', 0.5) + \
-                    (1 - fuzzy_weights.get('w_fur', 0.5))
+                cost = self._get_fuzzy_routing_cost(u_id, nh_id, dist)
                 
                 # 为骨干网CH提供成本折扣
-                if v_node.get("is_gateway_ch", False):
-                    cost *= self.config.get('routing', {}).get('gateway_hop_discount', 0.7)
-                elif self.calculate_distance_to_base_station(nh_id) <= (self.network_diagonal * 0.4):
-                    cost *= self.config.get('routing', {}).get('relay_hop_discount', 0.85)
+                if self.calculate_distance_to_base_station(nh_id) <= relay_zone_radius:
+                    energy_threshold = 0.4 # 中心区域节点的能量警戒线
+                    if e_v_norm < energy_threshold:
+                        # 能量越低，惩罚越大（指数级）
+                        penalty_factor = 1.0 + 2.0 * ((energy_threshold - e_v_norm) / energy_threshold)**2
+                        cost *= penalty_factor
+                        logger.debug(f"NH {nh_id} (Central, Low Energy) cost penalized by x{penalty_factor:.2f}")
 
                 G_ch_routing.add_edge(u_id, nh_id, weight=cost)
 
@@ -1888,7 +1521,7 @@ class WSNEnv:
 
         # --- 阶段 5: 批量传输决策与意图生成 ---
         transfer_intentions = []
-        active_ch_list_sorted = sorted(routing_nodes, key=lambda cid: self.nodes[cid]["energy"], reverse=True)
+        active_ch_list_sorted = sorted(routing_nodes, key=lambda cid: self.calculate_distance_to_base_station(cid), reverse=True)
         avg_packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
         q_cfg = self.config.get('q_learning', {}).get('ch_management', {})
         energy_budget_ratio = q_cfg.get('max_energy_budget_per_round_for_tx', 0.1)
@@ -1911,17 +1544,44 @@ class WSNEnv:
             energy_budget = ch_node_data["energy"] * energy_budget_ratio
             max_packets_by_energy = int(energy_budget / energy_per_packet_tx) if energy_per_packet_tx > 0 else 0
 
+            # -----------【层级一优化：背压流控】-----------
             available_slots_in_nh = float('inf')
+            backpressure_factor = 1.0 # 1.0表示无压力
+
             if chosen_next_hop_id != self.BS_ID:
                 nh_buffer = self.packets_in_transit.get(chosen_next_hop_id, [])
                 available_slots_in_nh = self.ch_forwarding_buffer_size - len(nh_buffer)
+                
+                nh_node = self.nodes[chosen_next_hop_id]
+                nh_energy_level = nh_node['energy'] / nh_node['initial_energy']
+                nh_buffer_occupancy = len(nh_buffer) / self.ch_forwarding_buffer_size
+                
+                # 如果下一跳自己都找不到路，施加最大背压
+                # .get的第二个参数是默认值，以防chosen_next_hop_id还未被设置
+                if nh_node.get("chosen_next_hop_id", self.NO_PATH_ID) == self.NO_PATH_ID and self.calculate_distance_to_base_station(chosen_next_hop_id) > nh_node['current_communication_range']:
+                    congestion_index = 1.0
+                else:
+                    congestion_index = (nh_buffer_occupancy + (1.0 - nh_energy_level)) / 2.0
+                
+                backpressure_factor = max(0, 1.0 - congestion_index)
 
             num_packets_in_buffer = len(self.packets_in_transit[ch_id])
-            num_packets_to_send = max(0, min(num_packets_in_buffer, max_packets_by_energy, available_slots_in_nh, abs_max_packets))
-            
+            max_packets_by_backpressure = int(abs_max_packets * backpressure_factor)
+            num_packets_to_send = max(0, min(
+                num_packets_in_buffer,          # 限制1：不能超过自己有的
+                max_packets_by_energy,          # 限制2：不能超过能量预算
+                available_slots_in_nh,          # 限制3：不能超过下游容量
+                max_packets_by_backpressure,    # 限制4：不能超过考虑了背压的上限
+                abs_max_packets                 # 限制5：绝对不能超过配置的上限（例如5）
+            ))
+
             if num_packets_to_send > 0:
+                # 从缓冲区头部取出要发送的数据包批次
                 packet_batch = self.packets_in_transit[ch_id][:num_packets_to_send]
+                # 将这个传输意图（谁发，发给谁，发什么）加入列表
                 transfer_intentions.append((ch_id, chosen_next_hop_id, packet_batch))
+            logger.debug(f"CH {ch_id} -> NH {chosen_next_hop_id}: Backpressure={backpressure_factor:.2f}, NumToSend={num_packets_to_send}")
+            # -----------【修改结束】-----------
 
         # --- 阶段 6: 批量传输执行与冲突处理 ---
         delivery_attempts = {}
@@ -1995,6 +1655,21 @@ class WSNEnv:
 
         # [核心重构] 创建一个字典列表，存储每个候选者的所有决策信息
         candidate_decision_info = []
+
+        # -----------【核心修改：动态Dijkstra影响力】-----------
+        # 1. 先计算所有候选者的原始Q值，以评估“经验丰富度”
+        original_q_values = [self.get_q_value_select_next_hop(ch_id, c[0]) for c in candidates_info if c[0] not in path_history]
+        
+        # 2. 计算Q值的标准差，作为“经验分化度”的指标
+        q_std_dev = np.std(original_q_values) if original_q_values else 0
+        
+        # 3. 动态调整Dijkstra(path_reward)的权重
+        # 如果Q值分化很小（经验不足或看法一致），则提高Dijkstra的权重；反之则降低。
+        # 使用一个sigmoid函数来平滑地调整权重
+        dijkstra_trust_factor = 1.0 - (1.0 / (1.0 + np.exp(-5 * (q_std_dev - 0.5)))) # sigmoid函数
+        
+        logger.debug(f"CH {ch_id}: Q_std_dev={q_std_dev:.3f}, Dijkstra_trust_factor={dijkstra_trust_factor:.3f}")
+        # -----------【修改结束】-----------
         
         for nh_id, nh_type, dist in candidates_info:
             if nh_id in path_history:
@@ -2006,7 +1681,7 @@ class WSNEnv:
             if current_cost == float('inf'):
                 path_reward = -10
             else:
-                path_reward = (current_cost - next_hop_cost) * path_reward_factor
+                path_reward = (current_cost - next_hop_cost) * path_reward_factor * dijkstra_trust_factor
             
             congestion_penalty = 0.0
             if nh_id != self.BS_ID:
@@ -2128,120 +1803,6 @@ class WSNEnv:
             )
             
 
-    def _remedy_isolated_nodes(self):
-        """
-        [V10.0 适配版] 对孤立节点进行补救，优先选择接入型常规CH。
-        """
-        logger.info("开始对孤立普通节点进行补救...")
-        
-        # 1. 找到所有需要被补救的孤立节点
-        isolated_nodes = [
-            n for n in self.nodes 
-            if n["status"] == "active" and n["role"] == "normal" and n["cluster_id"] == -1
-        ]
-        if not isolated_nodes:
-            return # 没有孤立节点，直接返回
-
-        # 2. 找到所有可供选择的、未满员的常规CH，并按角色分类
-        available_access_chs = []
-        available_relay_chs = []
-        relay_zone_radius = self.network_diagonal * 0.4
-        
-        # 计算容量上限
-        num_alive_non_direct_bs_nodes = len([n for n in self.nodes if n["status"] == "active" and n["role"] == "normal"])
-        num_active_regular_chs = len(self.regular_chs_for_epoch)
-        avg_members_per_ch_ideal = num_alive_non_direct_bs_nodes / num_active_regular_chs if num_active_regular_chs > 0 else 10
-        max_members_for_ch = max(1, int(avg_members_per_ch_ideal * self.ch_max_members_factor))
-
-        # [核心修改] 只在常规CH中寻找空位
-        for ch_id in self.regular_chs_for_epoch:
-            ch_node = self.nodes[ch_id]
-            if ch_node["status"] != "active":
-                continue
-                
-            current_members = len([m for m in self.nodes if m.get("cluster_id") == ch_id])
-            if current_members < max_members_for_ch:
-                # 判断角色
-                if self.calculate_distance_to_base_station(ch_id) <= relay_zone_radius:
-                    available_relay_chs.append(ch_id)
-                else:
-                    available_access_chs.append(ch_id)
-        
-        available_gateway_chs = []
-        if hasattr(self, 'gateway_chs_for_epoch'):
-            for ch_id in self.gateway_chs_for_epoch:
-                ch_node = self.nodes[ch_id]
-                if ch_node["status"] != "active":
-                    continue
-                # 网关CH没有容量限制，或有一个非常宽松的限制
-                available_gateway_chs.append(ch_id)
-
-        # 3. [核心修改] 分层补救逻辑
-        num_remedied = 0
-        for node in isolated_nodes:
-            best_ch_id = -1
-            min_dist = float('inf')
-
-            # a. 优先尝试在“接入CH”中寻找最近的
-            if available_access_chs:
-                for ch_id in available_access_chs:
-                    dist = self.calculate_distance(node["id"], ch_id)
-                    if dist < node["base_communication_range"] and dist < min_dist:
-                        min_dist = dist
-                        best_ch_id = ch_id
-            
-            # b. 如果在接入CH中找不到，才退而求其次，尝试“中继CH”
-            if best_ch_id == -1 and available_relay_chs:
-                logger.warning(f"孤立节点 {node['id']} 在接入CH中找不到归属，尝试连接到中继CH。")
-                min_dist = float('inf') # 重置最小距离
-                for ch_id in available_relay_chs:
-                    dist = self.calculate_distance(node["id"], ch_id)
-                    if dist < node["base_communication_range"] and dist < min_dist:
-                        min_dist = dist
-                        best_ch_id = ch_id
-            
-            if best_ch_id == -1 and available_gateway_chs:
-                min_dist = float('inf')
-                for ch_id in available_gateway_chs:
-                    dist = self.calculate_distance(node["id"], ch_id)
-                    if dist < node["base_communication_range"] and dist < min_dist:
-                        min_dist = dist
-                        best_ch_id = ch_id
-                        choice_type = "Gateway"
-            
-            # c. 如果找到了最佳CH，则进行关联
-            if best_ch_id != -1:
-                node["cluster_id"] = best_ch_id
-                num_remedied += 1
-                # 从可用列表中移除，以防止它被过度填充（虽然不太可能，但更健壮）
-                # 注意：这个移除操作会影响后续孤立节点的选择，可以根据需要决定是否保留
-                # if best_ch_id in available_access_chs:
-                #     # ... (更复杂的负载更新和列表移除逻辑)
-                # elif best_ch_id in available_relay_chs:
-                #     # ...
-        
-        logger.info(f"孤立节点补救完成，{num_remedied} / {len(isolated_nodes)} 个节点成功加入新簇。")
-
-    def simulate_base_round_energy_consumption(self):
-        """只模拟与Q学习动作无关的背景能耗，如空闲监听、基础感知"""
-        # ... (只包含 idle_listening 和 sensing cost 的逻辑) ...
-        energy_cfg = self.config.get('energy', {})
-        try:
-            idle_listening_cost_per_round = float(energy_cfg.get('idle_listening_per_round', 1e-6)) # 调小默认值
-            sensing_cost_per_round = float(energy_cfg.get('sensing_per_round', 5e-7))
-        except (ValueError, TypeError):
-            idle_listening_cost_per_round = 1e-6
-            sensing_cost_per_round = 5e-7
-        
-        nodes_to_kill_this_round = []
-        for node in self.nodes:
-            if node["status"] == "active":
-                cost = idle_listening_cost_per_round + sensing_cost_per_round
-                if self.consume_node_energy(node["id"], cost): # consume_node_energy 会处理死亡
-                    pass # 节点仍然存活
-                # else: 节点已在此处被标记为死亡 (如果能量耗尽)
-        # kill_node 的调用现在在 consume_node_energy 内部
-
     def _penalize_failed_routing_action(self, ch_id, failed_action_id):
             """对失败的路由动作施加Q值惩罚。"""
             if ch_id == -1 or not (0 <= ch_id < len(self.nodes)):
@@ -2257,38 +1818,6 @@ class WSNEnv:
             self.nodes[ch_id]["q_table_select_next_hop"] = q_table
             logger.warning(f"CH {ch_id}: 因路由失败，对选择下一跳 {failed_action_id} 的动作施加了惩罚。Q值从 {old_q:.2f} 更新为 {new_q:.2f}。")
     
-
-    def _stage_routing_energy_costs(self, ch_id, next_hop_id, distance, packet):
-        """
-        [最终修正版] 暂存一次路由传输的TX/RX能耗，考虑可变包大小。
-        聚合能耗已在包生成时计算。
-        """
-        if not packet:
-            logger.warning(f"在暂存能耗时，CH {ch_id} 传入的packet为空，跳过。")
-            return
-            
-        # 1. 根据包内含的原始数据量，计算有效的传输包大小
-        base_packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
-        num_raw_packets = packet.get("num_raw_packets", 1)
-        fusion_efficiency_factor = self.config.get('energy', {}).get('fusion_efficiency_factor', 0.1)
-        
-        if num_raw_packets > 1:
-            effective_packet_size = base_packet_size * (1 + (num_raw_packets - 1) * fusion_efficiency_factor)
-        else:
-            effective_packet_size = base_packet_size
-            
-        logger.debug(f"CH {ch_id} 发送融合包，包含 {num_raw_packets} 个原始包，有效大小: {effective_packet_size:.0f} bits")
-
-        # 2. 计算并暂存发送方 (CH) 的TX能耗
-        tx_energy = self.calculate_transmission_energy(distance, effective_packet_size, is_tx_operation=True)
-        self.nodes[ch_id]["pending_tx_energy"] += tx_energy
-        self.nodes[ch_id]["tx_count"] += 1
-
-        # 3. 计算并暂存接收方的RX能耗 (如果接收方不是BS)
-        if next_hop_id != self.BS_ID and 0 <= next_hop_id < len(self.nodes) and self.nodes[next_hop_id]["status"] == "active":
-            rx_energy = self.calculate_transmission_energy(0, effective_packet_size, is_tx_operation=False)
-            self.nodes[next_hop_id]["pending_rx_energy"] += rx_energy
-            self.nodes[next_hop_id]["rx_count"] += 1
 
     def _get_transmission_success_rate(self, ch_id, next_hop_id, next_hop_type, distance):
         """获取到下一跳的传输成功率。"""
@@ -2553,123 +2082,7 @@ class WSNEnv:
         dy = node['position'][1] - base_pos[1]
         
         return math.sqrt(dx*dx + dy*dy)
-
-
-    def promote_gateway_chs(self):
-        """
-        [V2.5核心] 识别能直连BS的节点，并将它们强制提升为特殊的“网关CH”。
-        """
-        logger.info("开始提拔网关CH...")
-        direct_comm_threshold = self.config.get('network', {}).get('direct_bs_comm_threshold', 50)
-        initial_e = self.E0 if hasattr(self, 'E0') and self.E0 > 0 else self.config.get('energy', {}).get('initial', 1.0)
-        min_energy_for_gateway = self.config.get('energy', {}).get('min_energy_direct_bs_factor', 0.1) * initial_e
-
-        promoted_gateway_chs = []
-        for node in self.nodes:
-            if node["status"] == "active":
-                d_to_bs = self.calculate_distance_to_base_station(node["id"])
-                # 这里的 can_connect_bs_directly 标记也一并设置
-                node["can_connect_bs_directly"] = (d_to_bs <= direct_comm_threshold)
-
-                if node["can_connect_bs_directly"] and node["energy"] > min_energy_for_gateway:
-                    node["role"] = "cluster_head"
-                    node["is_gateway_ch"] = True
-                    node["cluster_id"] = node["id"]
-                    node["time_since_last_ch"] = 0 
-                    promoted_gateway_chs.append(node["id"])
-
-        if promoted_gateway_chs:
-            logger.info(f"已成功提拔 {len(promoted_gateway_chs)} 个节点为固定的网关CH: {promoted_gateway_chs}")
-        
-        return promoted_gateway_chs 
     
-    def assign_nodes_to_clusters(self, attempt=1, nodes_to_assign=None, candidate_chs=None):
-        """
-        辅助函数：尝试将指定的普通节点分配给指定的候选簇头。
-        主要用于Q学习选择失败后的备用策略或特定场景。
-        """
-        if nodes_to_assign is None: # 默认处理所有未分配的普通节点
-            nodes_to_assign = [n for n in self.nodes if n["status"] == "active" and n["role"] == "normal" and n["cluster_id"] == -1]
-        
-        if candidate_chs is None: # 默认使用本轮的候选CH
-            candidate_chs = self.candidate_cluster_heads
-
-        if not candidate_chs:
-            logger.info(f"Assign attempt {attempt}: 没有候选簇头，节点无法加入簇。")
-            return len(nodes_to_assign) 
-
-        logger.info(f"Assign attempt {attempt}: 开始将 {len(nodes_to_assign)} 个普通节点分配给 {len(candidate_chs)} 个候选簇头...")
-        num_newly_assigned_this_attempt = 0
-        
-        for node_data in nodes_to_assign:
-            if node_data["cluster_id"] != -1: continue # 如果已经被分配（可能通过Q学习），则跳过
-
-            min_dist_to_ch = float('inf')
-            assigned_ch_id = -1
-            
-            current_comm_range = node_data["base_communication_range"]
-            if attempt > 1:
-                increase_factor = min(1 + (attempt - 1) * 0.25, self.max_communication_range_increase_factor)
-                current_comm_range = node_data["base_communication_range"] * increase_factor
-            node_data["current_communication_range"] = current_comm_range
-
-            for ch_id in candidate_chs:
-                if not (0 <= ch_id < len(self.nodes)) or self.nodes[ch_id]["status"] == "dead":
-                    continue
-                # 候选CH也应该使用其当前通信范围（尽管在DEEC选举阶段可能还没特殊调整）
-                if self.nodes[ch_id]["id"] not in self.candidate_cluster_heads : continue # 确保是候选CH
-
-                distance = self.calculate_distance(node_data["id"], ch_id)
-                if distance <= node_data["current_communication_range"] and \
-                   distance <= self.nodes[ch_id]["current_communication_range"]:
-                    if distance < min_dist_to_ch:
-                        min_dist_to_ch = distance
-                        assigned_ch_id = ch_id
-            
-            if assigned_ch_id != -1:
-                node_data["cluster_id"] = assigned_ch_id
-                # node_data["role"] = "member" # 可以有一个更细致的角色
-                num_newly_assigned_this_attempt +=1
-        
-        remaining_isolated = len([n for n in nodes_to_assign if n["cluster_id"] == -1])
-        logger.info(f"Assign attempt {attempt}: 新分配了 {num_newly_assigned_this_attempt} 个节点。仍有 {remaining_isolated} 个来自输入列表的节点未分配。")
-        return remaining_isolated
-    
-
-    def handle_isolated_nodes(self):
-        """处理孤立节点，尝试增加通信范围或调整p_opt"""
-        max_attempts = 3 # 最多尝试增加通信范围的次数
-        isolated_count = 0
-        for attempt in range(1, max_attempts + 1):
-            isolated_count = self.assign_nodes_to_clusters(attempt=attempt)
-            if isolated_count == 0:
-                logger.info(f"所有节点均已分配到簇 (在第 {attempt} 次尝试后)。")
-                return True # 所有节点都分配好了
-            logger.info(f"第 {attempt} 次分配后，仍有 {isolated_count} 个孤立节点。")
-
-        # 如果多次增加通信范围后仍有孤立节点，考虑下一轮增加p_opt
-        num_alive_normal_nodes = len([n for n in self.nodes if n["status"] == "active" and n["role"] == "normal" and n["cluster_id"] == -1])
-        if num_alive_normal_nodes > 0 : # 确认是普通节点孤立
-            # 动态调整 p_opt_current
-            # 简单策略：如果孤立节点比例过高，轻微增加 p_opt
-            # 注意：p_opt不应无限增大，例如不超过初始值的2-3倍或一个上限（如0.3）
-            current_ch_ratio = len(self.cluster_heads) / self.get_alive_nodes() if self.get_alive_nodes() > 0 else 0
-            if current_ch_ratio < self.min_ch_to_node_ratio_target or isolated_count > self.get_alive_nodes() * 0.1: # 如果CH比例过低或孤立节点超过10%
-                self.p_opt_current = min(self.p_opt_initial * 2, self.p_opt_current * 1.1, 0.3) 
-                logger.info(f"由于存在较多孤立节点或CH比例低，下一轮 p_opt 调整为: {self.p_opt_current:.3f}")
-            elif len(self.cluster_heads) > self.get_alive_nodes() * self.p_opt_initial * 1.5 : # 如果CH过多
-                self.p_opt_current = max(self.p_opt_initial * 0.8, self.p_opt_current * 0.95) # 适当减少
-                logger.info(f"由于CH数量过多，下一轮 p_opt 调整为: {self.p_opt_current:.3f}")
-            else:
-                 # 如果孤立节点不多，且CH数量合适，可以逐渐恢复p_opt
-                if self.p_opt_current > self.p_opt_initial:
-                    self.p_opt_current = max(self.p_opt_initial, self.p_opt_current * 0.98)
-
-
-        # 对于本轮仍然孤立的节点，它们将不参与数据传输或直接尝试联系基站（如果策略允许）
-        # 在我们的模型中，它们暂时就是孤立的。
-        return isolated_count == 0
-
     def calculate_distance(self, node1_idx, node2_idx):
         """计算两个节点之间的欧氏距离 (基于节点ID)"""
         # 修改为接受节点ID，或直接接受节点字典
@@ -2678,72 +2091,7 @@ class WSNEnv:
         x1, y1 = node1["position"]
         x2, y2 = node2["position"]
         return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-       
-    def simulate_round_energy_consumption(self):
-        """模拟一轮中由于基本操作和数据传输产生的能量消耗"""
-        energy_cfg = self.config.get('energy', {})
-        try:
-            idle_listening_cost_per_round = float(energy_cfg.get('idle_listening_per_round', 1e-5))
-            sensing_cost_per_round = float(energy_cfg.get('sensing_per_round', 5e-6))
-        except (ValueError, TypeError):
-            logger.error("配置文件中的 idle_listening_per_round 或 sensing_per_round 不是有效的数字。请检查 config.yml。")
-            idle_listening_cost_per_round = 1e-5
-            sensing_cost_per_round = 5e-6
-        
-        packet_size_bits = self.config.get("simulation",{}).get("packet_size", 4000)
-
-        for node_data in self.nodes: # 使用不同的变量名
-            if node_data["status"] != "active":
-                continue
-
-            current_node_id = node_data["id"]
-            total_cost_this_round = idle_listening_cost_per_round + sensing_cost_per_round
-
-            if node_data["role"] == "normal" and node_data["cluster_id"] != -1 and node_data["cluster_id"] != -2 : # 已加入簇且非直连BS
-                # 假设普通节点每轮都向其CH发送一个数据包
-                ch_id = node_data["cluster_id"]
-                if 0 <= ch_id < len(self.nodes) and self.nodes[ch_id]["status"] == "active":
-                    distance_to_ch = self.calculate_distance(current_node_id, ch_id)
-                    
-                    # 普通节点发送成本
-                    tx_c = self.calculate_transmission_energy(distance_to_ch, packet_size_bits, is_tx_operation=True)
-                    total_cost_this_round += tx_c
-                    node_data["tx_count"] += 1 # 手动增加计数器
-
-                    # 对应CH的接收成本
-                    rx_c_for_ch = self.calculate_transmission_energy(0, packet_size_bits, is_tx_operation=False)
-                    if self.consume_node_energy(ch_id, rx_c_for_ch): # CH消耗接收能量
-                         self.nodes[ch_id]["rx_count"] += 1
-                else:
-                    logger.warning(f"普通节点 {current_node_id} 的簇头 {ch_id} 无效或已死亡，本轮不发送。")
-            
-            elif node_data.get("role_override") == "direct_to_bs": # 直连BS的节点
-                distance_to_bs = self.calculate_distance_to_base_station(current_node_id)
-                tx_c_direct = self.calculate_transmission_energy(distance_to_bs, packet_size_bits, is_tx_operation=True)
-                total_cost_this_round += tx_c_direct
-                node_data["tx_count"] += 1
-                # BS不计算能耗
-
-            elif node_data["role"] == "cluster_head":
-                # CH 接收来自成员节点的数据 (这部分已在上面普通节点发送时计算并扣除CH能量)
-                # CH 可能需要聚合数据 (假设有固定聚合成本)
-                aggregation_cost = float(energy_cfg.get('aggregation_cost_per_packet', 5e-9)) * packet_size_bits # 示例
-                # 假设CH聚合了收到的所有数据包（简化：这里只算一次聚合成本，实际应基于成员数）
-                # 查找有多少成员连接到这个CH
-                num_members = len([m_node for m_node in self.nodes if m_node.get("cluster_id") == current_node_id and m_node["status"] == "active"])
-                total_cost_this_round += aggregation_cost * max(1, num_members) # 至少聚合一次（自身数据）
-
-                # CH 将聚合后的数据发送给基站 (或下一跳CH，这里简化为直接到BS)
-                distance_to_bs_for_ch = self.calculate_distance_to_base_station(current_node_id)
-                # 假设CH发送一个（可能更大的）聚合数据包
-                aggregated_packet_size_factor = float(self.config.get("simulation", {}).get("ch_aggregated_packet_factor", 1.0)) # 聚合后数据包大小因子
-                tx_c_ch = self.calculate_transmission_energy(distance_to_bs_for_ch, packet_size_bits * aggregated_packet_size_factor, is_tx_operation=True)
-                total_cost_this_round += tx_c_ch
-                node_data["tx_count"] += 1
-
-            # 最终从节点扣除本轮总成本
-            self.consume_node_energy(current_node_id, total_cost_this_round)
-        
+         
     
     def calculate_transmission_energy(self, distance, packet_size_bits, is_tx_operation=True):
         """
@@ -2870,9 +2218,6 @@ class WSNEnv:
                  neighbor_ids.append(original_node_id)
         return neighbor_ids
 
-    def _handle_packet_transmission(self,node_id):
-        pass
-
     def get_network_energy(self):
         logger.info("get_network_energy")
         total_energy = 0
@@ -2893,12 +2238,6 @@ class WSNEnv:
         logger.info(f"节点 {node_id} 已被标记为死亡。")
         return True
 
-    def _get_packet_loss_rate(self, distance):
-        """基于距离的Log-normal阴影模型"""
-        PL_d0 = 55  # 参考距离d0=1m时的路径损耗(dB)
-        path_loss = PL_d0 + 10 * 3.0 * np.log10(distance) + np.random.normal(0, 4)
-        snr = 10 - path_loss  # 假设发射功率10dBm
-        return 1 / (1 + np.exp(snr - 5))  # Sigmoid模拟丢包率
 
     def get_pdr_moving_average(self):
         """计算PDR的移动平均值。"""
@@ -3053,100 +2392,6 @@ class WSNEnv:
                 # 3. 使用这个高质量的、基于真实结果的奖励来更新Q-table
                 self.update_q_value_select_ch(node_id, chosen_ch_id, final_reward)
 
-    def _ensure_ch_connectivity(self, preliminary_ch_set):
-        """
-        [V12.0 新增] 诊断初步CH集的连通性，并增选“桥接CH”来连接孤立的CH。
-        返回: (增选的桥接CH列表, 最终的完整CH集合)
-        """
-        if not preliminary_ch_set:
-            return [], set()
-
-        # 1. 构建初步CH网络的图
-        ch_graph = nx.Graph()
-        ch_list = list(preliminary_ch_set)
-        ch_graph.add_nodes_from(ch_list)
-        for i in range(len(ch_list)):
-            for j in range(i + 1, len(ch_list)):
-                u, v = ch_list[i], ch_list[j]
-                dist = self.calculate_distance(u, v)
-                # 使用增强后的范围进行双向判断
-                u_range = self.nodes[u].get("base_communication_range") * self.config.get('network', {}).get('ch_range_enhancement_factor', 1.0)
-                v_range = self.nodes[v].get("base_communication_range") * self.config.get('network', {}).get('ch_range_enhancement_factor', 1.0)
-                if dist <= u_range and dist <= v_range:
-                    ch_graph.add_edge(u, v)
-
-        # 2. 定义骨干网 (能直连BS的CH)
-        backbone_chs = {ch_id for ch_id in ch_list if self.calculate_distance_to_base_station(ch_id) <= self.nodes[ch_id].get("base_communication_range") * self.config.get('network', {}).get('ch_range_enhancement_factor', 1.0)}
-        if not backbone_chs:
-            # 如果没有任何CH能直连BS，则认为离BS最近的那个是骨干网的起点
-            if ch_list:
-                closest_ch_to_bs = min(ch_list, key=lambda cid: self.calculate_distance_to_base_station(cid))
-                backbone_chs.add(closest_ch_to_bs)
-            else:
-                return [], set() # 没有CH，无法操作
-
-        # 3. 寻找所有孤立的CH（无法通过CH网络到达任何一个骨干CH）
-        isolated_chs = []
-        for ch_id in ch_list:
-            is_connected_to_backbone = False
-            for backbone_node in backbone_chs:
-                if nx.has_path(ch_graph, ch_id, backbone_node):
-                    is_connected_to_backbone = True
-                    break
-            if not is_connected_to_backbone:
-                isolated_chs.append(ch_id)
-        
-        if not isolated_chs:
-            return [], preliminary_ch_set # 网络已完全连通
-
-        # 4. 为每个孤立的CH寻找并增选“桥接CH”
-        bridge_chs_to_add = set()
-        final_ch_set = set(preliminary_ch_set)
-
-        # 找到所有非CH的活跃节点作为桥接候选人
-        bridge_candidates = [
-            n for n in self.nodes 
-            if n["status"] == "active" and n["id"] not in final_ch_set
-        ]
-
-        for isolated_ch_id in isolated_chs:
-            # 找到离这个孤立CH最近的骨干CH
-            closest_backbone_ch = min(backbone_chs, key=lambda b_id: self.calculate_distance(isolated_ch_id, b_id))
-            
-            # 在孤立CH和最近的骨干CH之间的连线上寻找最佳“桥接点”
-            pos_isolated = self.nodes[isolated_ch_id]["position"]
-            pos_backbone = self.nodes[closest_backbone_ch]["position"]
-            
-            best_bridge_candidate = -1
-            min_bridge_score = float('inf')
-
-            for candidate in bridge_candidates:
-                # a. 候选点必须在两者之间的一个大致区域内
-                pos_candidate = candidate["position"]
-                # (简单的几何判断，可以优化)
-                
-                # b. 候选点的评分 = 到孤立CH的距离 + 到骨干CH的距离
-                # 我们希望选一个能同时连接两者的节点
-                dist_to_iso = self.calculate_distance(candidate["id"], isolated_ch_id)
-                dist_to_backbone = self.calculate_distance(candidate["id"], closest_backbone_ch)
-                
-                # 候选点必须有能力连接两者
-                cand_range = candidate.get("base_communication_range") * self.config.get('network', {}).get('ch_range_enhancement_factor', 1.0)
-                if dist_to_iso <= cand_range and dist_to_backbone <= cand_range:
-                    bridge_score = dist_to_iso + dist_to_backbone
-                    if bridge_score < min_bridge_score:
-                        min_bridge_score = bridge_score
-                        best_bridge_candidate = candidate["id"]
-
-            if best_bridge_candidate != -1:
-                bridge_chs_to_add.add(best_bridge_candidate)
-                final_ch_set.add(best_bridge_candidate)
-                # 将新加入的桥接CH也视为骨干网的一部分，以便后续的孤立CH可以连接到它
-                backbone_chs.add(best_bridge_candidate) 
-                # 从候选人中移除，防止被重复选择
-                bridge_candidates = [c for c in bridge_candidates if c["id"] != best_bridge_candidate]
-
-        return list(bridge_chs_to_add), final_ch_set
 
     def _validate_ch_routing_paths(self):
         """
@@ -3202,3 +2447,216 @@ class WSNEnv:
         dx = node['position'][0] - point_coords[0]
         dy = node['position'][1] - point_coords[1]
         return math.sqrt(dx*dx + dy*dy)
+    
+    def _elect_chs_with_global_suppression(self):
+        """
+        一个更简单的选举函数：计算所有节点的候选分数，然后通过拓扑抑制选出分布均匀的CH。
+        """
+        nodes_for_election = [n for n in self.nodes if n["status"] == "active"]
+        if not nodes_for_election: return []
+
+        # 1. 计算全局理想CH总数 (这部分逻辑可以复用)
+        total_ideal_ch_count = self._calculate_ideal_ch_count() # 将计算逻辑封装成一个函数
+
+        # 2. 计算所有候选节点的分数
+        scores = {}
+        reputation_threshold = self.config.get('q_learning', {}).get('reputation_threshold', 0.5)
+        penalty_weight = self.config.get('q_learning', {}).get('reputation_penalty_weight', 0.5)
+        normal_nodes = [n for n in self.nodes if n['status'] == 'active' and n['role'] == 'normal']
+        num_raters = len(normal_nodes)
+        for node in nodes_for_election:
+            node_id = node['id']
+            # 使用一个综合评分，例如：能量(50%) + 轮换(30%) + Q值(20%)
+            energy_score = node["energy"] / node["initial_energy"]
+            rotation_score = min(node["time_since_last_ch"] / (self.epoch_length * 2.0), 1.0)
+            q_advantage = 0
+            state_tuple = self.get_discrete_state_tuple_for_competition(node_id)
+            if state_tuple:
+                q0 = self.get_q_value_compete_ch(node_id, state_tuple, 0)
+                q1 = self.get_q_value_compete_ch(node_id, state_tuple, 1)
+                q_advantage = q1 - q0
+            # 基础分 = 能量(50%) + 轮换(30%) + Q竞争(20%)
+            base_score = 0.5 * energy_score + 0.3 * rotation_score + 0.2 * q_advantage
+
+            # b. 计算节点的“平均口碑分”
+            total_reputation_score = 0
+            if num_raters > 0:
+                for rater_node in normal_nodes:
+                    # 获取评价者(rater_node)对候选人(node_id)的评价
+                    total_reputation_score += self.get_q_value_select_ch(rater_node['id'], node_id)
+                avg_reputation_score = total_reputation_score / num_raters
+            else:
+                avg_reputation_score = 0.5 # 如果没有普通节点，给一个中性分
+            
+            # c. 计算口碑惩罚
+            reputation_penalty = 0.0
+            if avg_reputation_score < reputation_threshold:
+                # 口碑越差，惩罚因子越大 (0到1之间)
+                penalty_factor = (reputation_threshold - avg_reputation_score) / reputation_threshold
+                # 惩罚值 = 基础分 * 惩罚因子 * 惩罚权重(例如50%)
+                reputation_penalty = base_score * penalty_factor * penalty_weight
+            
+            # d. 计算最终分数
+            scores[node_id] = base_score - reputation_penalty
+        
+        # 3. 全局拓扑抑制选举
+        suppression_factor = self.config.get('deec', {}).get('ch_election', {}).get('suppression_factor', 0.5)
+        elected_chs = []
+        potential_candidates = dict(scores)
+        while len(elected_chs) < total_ideal_ch_count and potential_candidates:
+            best_id = max(potential_candidates, key=lambda k:potential_candidates[k])
+            elected_chs.append(best_id)
+            del potential_candidates[best_id]
+            
+            # 抑制邻居
+            neighbors_to_suppress = self.get_node_neighbors(best_id, self.nodes[best_id]["base_communication_range"])
+            for neighbor_id in neighbors_to_suppress:
+                if neighbor_id in potential_candidates:
+                    potential_candidates[neighbor_id] *= suppression_factor
+        
+        return elected_chs
+ 
+    def _calculate_ideal_ch_count(self):
+        """
+        [新增] 使用高阶模糊逻辑，计算出本轮网络理想的CH总数。
+        """
+        num_alive_eligible = len([n for n in self.nodes if n["status"] == "active"])
+        if num_alive_eligible == 0:
+            return 0
+
+        # 1. 获取输入模糊控制器的各项网络指标
+        pdr_ma = self.get_pdr_moving_average()
+        avg_energy_norm = self._calculate_current_average_energy() / self.E0
+        # getattr 用于安全地获取属性，如果上个epoch没有计算，则返回默认值0.0
+        isolated_rate = getattr(self, 'isolated_node_rate_last_epoch', 0.0)
+        congestion = getattr(self, 'congestion_level_last_epoch', 0.0)
+
+        # 2. 调用高阶模糊逻辑系统，计算p_opt调整因子
+        adjustment_factor = self.strategy_fuzzy_logic.compute_p_opt_factor(
+            pdr=pdr_ma,
+            energy=avg_energy_norm,
+            isolated_rate=isolated_rate,
+            congestion=congestion
+        )
+        
+        # 3. 使用初始的p_opt作为基准，进行动态调整
+        self.p_opt_current = self.p_opt_initial * adjustment_factor
+        
+        # 4. 对计算出的p_opt进行封顶，防止过高或过低，增加系统稳定性
+        p_opt_min_cap = self.config.get('deec', {}).get('p_opt_min_cap', 0.03)
+        p_opt_max_cap = self.config.get('deec', {}).get('p_opt_max_cap', 0.25)
+        self.p_opt_current = np.clip(self.p_opt_current, p_opt_min_cap, p_opt_max_cap)
+        
+        # 5. 计算出本轮理想的CH总配额，并返回
+        total_ideal_ch_count = int(num_alive_eligible * self.p_opt_current)
+        
+        logger.info(
+            f"高阶模糊策略决策 -> PDR_MA:{pdr_ma:.2f}, E_norm:{avg_energy_norm:.2f}, "
+            f"Iso_rate:{isolated_rate:.2f}, Congestion:{congestion:.2f} "
+            f"=> p_opt_adj_factor:{adjustment_factor:.3f}, p_opt_current:{self.p_opt_current:.3f} "
+            f"=> 理想CH总数: {total_ideal_ch_count}"
+        )
+        
+        return total_ideal_ch_count
+
+
+    def _run_ch_disqualification_and_remedy_phase(self):
+        """
+        [V-Final 8.0] 协调与补救阶段：罢免不合格CH并重新安置受影响的节点。
+        """
+        if not self.enable_ch_disqualification:
+            return
+
+        logger.info("协调阶段：检查并处理不合格的CH...")
+        
+        disqualified_chs = []
+        nodes_needing_reassignment = []
+
+        ch_list_snapshot = list(self.confirmed_cluster_heads_for_epoch)
+
+        for ch_id in ch_list_snapshot:
+            # 成员不包括CH自己
+            members = [n for n in self.nodes if n.get('cluster_id') == ch_id and n['id'] != ch_id]
+            
+            if len(members) <= self.ch_min_members_threshold:
+                disqualified_chs.append(ch_id)
+                
+                ch_node = self.nodes[ch_id]
+                ch_node['role'] = 'normal'
+                ch_node['cluster_id'] = -1
+                nodes_needing_reassignment.append(ch_node)
+                
+                for member_node in members:
+                    member_node['cluster_id'] = -1
+                    nodes_needing_reassignment.append(member_node)
+
+        if not disqualified_chs:
+            logger.info("所有CH均合格，无需处理。")
+            return
+
+        self.confirmed_cluster_heads_for_epoch = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if ch_id not in disqualified_chs]
+        logger.info(f"共取消了 {len(disqualified_chs)} 个CH的资格。开始为 {len(nodes_needing_reassignment)} 个节点重新分配...")
+
+        num_reassigned = 0
+        for node_data in nodes_needing_reassignment:
+            min_dist = float('inf')
+            assigned_ch_id = -1
+            for ch_id in self.confirmed_cluster_heads_for_epoch: # 只在合格的CH中寻找
+                if self.nodes[ch_id]['status'] == 'active':
+                    dist = self.calculate_distance(node_data['id'], ch_id)
+                    if dist < min_dist and dist <= node_data['base_communication_range']:
+                        min_dist = dist
+                        assigned_ch_id = ch_id
+            
+            node_data['cluster_id'] = assigned_ch_id
+            if assigned_ch_id != -1:
+                num_reassigned += 1
+
+        logger.info(f"重新分配完成，{num_reassigned} / {len(nodes_needing_reassignment)} 个节点找到了新家。")
+
+
+    def _get_fuzzy_ch_competition_reward_weights(self, node_id, raw_state):
+        """[新辅助函数] 获取CH竞争的模糊奖励权重。"""
+        current_total_energy = sum(n['energy'] for n in self.nodes if n['status'] == 'active')
+        current_total_initial_energy = sum(n['initial_energy'] for n in self.nodes if n['status'] == 'active' and n['initial_energy'] > 0)
+        net_energy_level_normalized = current_total_energy / current_total_initial_energy if current_total_initial_energy > 0 else 0
+        
+        node_self_energy_normalized = raw_state["e_self"]
+        num_alive = self.get_alive_nodes()
+        ch_density_global_val = len(self.confirmed_cluster_heads_for_epoch) / num_alive if num_alive > 0 else 0
+        ch_to_bs_dis_normalized = raw_state["d_bs"] / self.network_diagonal if self.network_diagonal > 0 else 0
+        
+        return self.reward_weights_adjuster.compute_reward_weights(
+            current_net_energy_level=net_energy_level_normalized,
+            current_node_self_energy=node_self_energy_normalized,
+            current_ch_density_global=ch_density_global_val,
+            current_ch_to_bs_dis_normalized=ch_to_bs_dis_normalized
+        )
+
+
+    def _get_fuzzy_routing_cost(self, u_id, v_id, dist):
+        """[新辅助函数] 获取CH路由的模糊成本。"""
+        u_node = self.nodes[u_id]
+        v_node = self.nodes[v_id]
+        
+        avg_load_for_nh_ref = self.get_alive_nodes() / len(self.confirmed_cluster_heads_for_epoch) if self.confirmed_cluster_heads_for_epoch else 10
+        
+        e_v_norm = v_node["energy"] / v_node["initial_energy"] if v_node["initial_energy"] > 0 else 0
+        load_v_actual = len(self.packets_in_transit.get(v_id, []))
+        r_success_norm = u_node.get("history_success_with_nh", {}).get(v_id, 0.9)
+        e_cost_norm = self.calculate_transmission_energy(dist, 4000) / self.calculate_transmission_energy(u_node["current_communication_range"], 4000)
+        
+        fuzzy_weights = self.ch_path_fuzzy_logic.compute_weights(
+            current_dc_bs_neighbor=self.calculate_distance_to_base_station(v_id),
+            current_e_c_neighbor=e_v_norm,
+            current_load_c_actual=load_v_actual,
+            current_r_c_success=r_success_norm,
+            current_e_ctx_cost_normalized=np.clip(e_cost_norm, 0, 1),
+            avg_load_for_neighbor_ch=avg_load_for_nh_ref
+        )
+        
+        cost = fuzzy_weights.get('w_path', 0.5) + \
+               fuzzy_weights.get('w_e_cost', 0.5) + \
+               fuzzy_weights.get('w_load_neighbor', 0.5) + \
+               (1 - fuzzy_weights.get('w_fur', 0.5))
+        return cost

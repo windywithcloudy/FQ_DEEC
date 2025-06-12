@@ -30,10 +30,13 @@ def get_env_class(algorithm_name):
             # 经典的DEEC对比算法
             module = importlib.import_module('env_deec')
             return getattr(module, 'WSNEnvDEEC')
-        # elif algorithm_name == 'Q-DEEC':
+        elif algorithm_name == 'Q-DEEC':
         #     # 如果你未来创建了env_q_deec.py，在这里添加即可
-        #     module = importlib.import_module('env_q_deec')
-        #     return getattr(module, 'WSNEnvQDEEC')
+            module = importlib.import_module('env_q_deec')
+            return getattr(module, 'WSNEnvQDEEC')
+        elif algorithm_name == 'HEED': # --- [新增] ---
+            module = importlib.import_module('env_heed')
+            return getattr(module, 'WSNEnvHEED')
         else:
             # 如果传入未知的算法名，则抛出错误
             raise ValueError(f"未知的算法名称: {algorithm_name}")
