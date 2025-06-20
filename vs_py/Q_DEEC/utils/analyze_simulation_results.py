@@ -108,51 +108,63 @@ def plot_comparison_charts(df_all):
     logger.info("已绘制：[新] 累计数据包投递率对比图")
 
 
-    # --- [核心修改] 4. 簇头数量动态对比 (分Epoch均值与标准差) ---
-    
-    # 假设你的Epoch长度是20轮 (如果不是，请修改这个值)
+    # --- [核心修改] 4. 簇头数量动态对比 (2x2 小倍图) ---
+    logger.info("开始处理和绘制最终版本的稳定化簇头数量图 (小倍图版本)...")
+
+    # 步骤 1 & 2: 数据处理 (与之前相同)
     epoch_length = 20
-    
-    # 创建一个新的列'epoch'，用于对数据进行分组
     df_all['epoch'] = (df_all['round'] // epoch_length) * epoch_length
     
-    # 使用`groupby`来计算每个算法在每个epoch的CH数量的均值和标准差
-    # .agg() 函数可以同时进行多个聚合操作
-    df_ch_stats = df_all.groupby(['algorithm', 'epoch'])['num_ch'].agg(['mean', 'std']).reset_index()
+    try:
+        df_ch_stats = df_all.groupby(['algorithm', 'epoch'])['num_ch'].agg(['mean', 'std']).reset_index()
+        df_ch_stats['std'] = df_ch_stats['std'].fillna(0)
+    except Exception as e:
+        logger.error(f"在计算统计数据时出错: {e}")
+        return
 
-    plt.figure(figsize=(12, 7))
-    
-    # 使用Seaborn的lineplot来绘制均值曲线
-    sns.lineplot(data=df_ch_stats, x='epoch', y='mean', hue='algorithm', lw=2, legend=True)
-    
-    # --- 绘制标准差误差带 ---
-    # 获取当前图的Axes对象，以便在上面绘制
-    ax = plt.gca()
-    algorithms = df_ch_stats['algorithm'].unique()
-    palette = sns.color_palette(n_colors=len(algorithms)) # 获取当前调色板
-    
-    # 为每个算法绘制其误差带
-    for i, algo in enumerate(algorithms):
-        algo_data = df_ch_stats[df_ch_stats['algorithm'] == algo]
+    # 步骤 3: 使用 Seaborn 的 `FacetGrid` 创建小倍图网格
+    # FacetGrid 是专门用于创建小倍图的强大工具
+    g = sns.FacetGrid(
+        df_ch_stats, 
+        col="algorithm",  # 按 'algorithm' 列来创建不同的子图列
+        col_wrap=2,       # 每行最多显示2个子图，形成 2x2 网格
+        height=4,         # 每个子图的高度
+        aspect=1.5,       # 每个子图的宽高比
+        sharey=True,      # 【关键】所有子图共享Y轴，确保对比的公平性
+        legend_out=True
+    )
+
+    # 步骤 4: 在每个子图上绘制均值曲线
+    # g.map() 函数会将指定的绘图函数应用到每个子图上
+    g.map(sns.lineplot, 'epoch', 'mean', lw=2.5, errorbar=None) # errorbar=None 告诉lineplot不要画默认的置信区间
+
+    # 步骤 5: 在每个子图上绘制标准差误差带
+    # 我们需要遍历每个子图的Axes对象来添加fill_between
+    for ax, (_, algo_data) in zip(g.axes.flat, g.facet_data()):
         ax.fill_between(
             algo_data['epoch'],
             algo_data['mean'] - algo_data['std'],
             algo_data['mean'] + algo_data['std'],
-            color=palette[i],
-            alpha=0.2  # 设置透明度，让误差带看起来更美观
+            alpha=0.2
         )
+        # 为每个子图设置网格线
+        ax.grid(True)
 
-    # 更新图表标题和标签
-    plt.title('Cluster Head Dynamics (Mean and Std. Dev. per Epoch)', fontsize=16)
-    plt.xlabel('Simulation rounds (Round)', fontsize=12)
-    plt.ylabel('Number of Cluster Heads', fontsize=12)
-    # 你可能需要根据你的数据调整Y轴范围，确保所有误差带都能显示
-    # plt.ylim(0, df_ch_stats['mean'].max() + df_ch_stats['std'].max() + 2) 
-    plt.legend(title='algorithm') # lineplot已经生成了图例
+    # 步骤 6: 设置总标题和坐标轴标签
+    # g.fig 是整个图的对象
+    g.fig.suptitle('Cluster Head Dynamics (Mean and Std. Dev. per Epoch)', y=1.03, fontsize=16) 
+    # g.set_axis_labels() 为所有共享的轴设置标签
+    g.set_axis_labels('Simulation rounds (Round)', 'Number of Cluster Heads')
+    # g.set_titles() 可以为每个子图设置标题，这里用算法名
+    g.set_titles("Algorithm: {col_name}")
     
-    plt.savefig(OUTPUT_ANALYSIS_DIR / "comparison_ch_count_stabilized.png", dpi=150) # 保存为新文件名
+    # 调整布局，防止标题重叠
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+    # 保存图像
+    plt.savefig(OUTPUT_ANALYSIS_DIR / "comparison_ch_count_grid.png", dpi=300)
     plt.close()
-    logger.info("已绘制：[新] 稳定化的簇头数量动态对比图")
+    logger.info("已绘制并保存最终版本的小倍图簇头数量图。")
 
 def main_analysis():
     """主分析函数"""
