@@ -15,6 +15,7 @@ class WSNEnvQDEEC(WSNEnv):
     def __init__(self, config_path=None, performance_log_path=None, ch_behavior_log_path=None):
         # 首先调用父类的构造函数，加载所有通用配置和基础设施
         super().__init__(config_path, performance_log_path, ch_behavior_log_path)
+        self.is_intelligent_agent = True
         
         logger.info("="*20)
         logger.info("Q-DEEC 环境已初始化。")
@@ -22,7 +23,7 @@ class WSNEnvQDEEC(WSNEnv):
         logger.info("仅在CH路由成本计算中，用固定权重模型替代模糊逻辑。")
         logger.info("="*20)
 
-    def _get_fuzzy_routing_cost(self, u_id, v_id, dist):
+    def _get_fuzzy_routing_cost(self, u_id, v_id, dist, use_dynamic_load=True):
         """
         [重写] CH路由成本计算。
         用一个简单的、基于物理属性的固定权重模型来替代模糊逻辑。
@@ -36,23 +37,32 @@ class WSNEnvQDEEC(WSNEnv):
         u_node = self.nodes[u_id]
         v_node = self.nodes[v_id]
         
-        # 计算下一跳的物理状态
-        energy_v_norm = 1.0 - (v_node['energy'] / v_node['initial_energy']) if v_node['initial_energy'] > 0 else 1.0
-        buffer_v = self.packets_in_transit.get(v_id, [])
-        load_v_norm = len(buffer_v) / self.ch_forwarding_buffer_size if self.ch_forwarding_buffer_size > 0 else 0
+       # 计算下一跳的物理状态
+        # 能量越高越好，所以成本应该与 (1 - 归一化能量) 成正比
+        energy_cost_v = 1.0 - (v_node['energy'] / v_node['initial_energy']) if v_node['initial_energy'] > 0 else 1.0
         
+        load_cost_v = 0
+        # 只有在明确指示使用动态负载时，才计算它
+        # 这使得Q-DEEC在构建路由图时（use_dynamic_load=False）和FQ-DEEC的行为完全一致
+        if use_dynamic_load:
+            buffer_v = self.packets_in_transit.get(v_id, [])
+            load_cost_v = len(buffer_v) / self.ch_forwarding_buffer_size if self.ch_forwarding_buffer_size > 0 else 0
+        
+        # 距离成本
+        dist_cost = dist / u_node["base_communication_range"] if u_node["base_communication_range"] > 0 else 1.0
+
         # 计算一个线性的、非模糊的成本值
-        cost = (w_dist * (dist / u_node["base_communication_range"]) + 
-                w_energy * energy_v_norm + 
-                w_load * load_v_norm)
+        cost = (w_dist * dist_cost + 
+                w_energy * energy_cost_v + 
+                w_load * load_cost_v)
         
         # 对骨干网节点的能量惩罚逻辑保持不变，以确保路由的稳定性
         relay_zone_radius = self.network_diagonal * 0.4
-        if self.calculate_distance_to_base_station(v_id) <= relay_zone_radius:
-            energy_threshold = 0.4
-            if energy_v_norm > (1.0 - energy_threshold): # 注意这里是能量损耗
-                penalty_factor = 1.0 + 2.0 * ((energy_v_norm - (1.0 - energy_threshold)) / energy_threshold)**2
-                cost *= penalty_factor
+        energy_threshold = 0.4
+        current_energy_norm = v_node['energy'] / v_node['initial_energy'] if v_node['initial_energy'] > 0 else 0
+        if self.calculate_distance_to_base_station(v_id) <= relay_zone_radius and current_energy_norm < energy_threshold:
+            penalty_factor = 1.0 + 2.0 * ((energy_threshold - current_energy_norm) / energy_threshold)**2
+            cost *= penalty_factor
         
         return cost
 

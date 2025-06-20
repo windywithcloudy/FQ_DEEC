@@ -31,12 +31,13 @@ energy:
   
 # 仿真控制
 simulation:
-  total_rounds: 5000      # 总仿真轮数
+  total_rounds: 2000      # 总仿真轮数
   packet_size: 4000         # 数据包大小(bit)
   warmup_rounds: 50         # 预热阶段轮数
   max_packet_hops: 10       #最大跳数
   use_q_learning: false
   use_fuzzy_logic: false
+  debug_mode: false 
 
 # 可视化设置
 visualization:
@@ -57,9 +58,9 @@ fuzzy:
 
 # DEEC 协议参数
 deec:
-  p_opt: 0.1                # 期望的簇头百分比 (optimal percentage of CHs)
+  p_opt: 0.08                # 期望的簇头百分比 (optimal percentage of CHs)
   p_opt_min: 0.03 # [新增] 能量耗尽时，p_opt的下限
-  p_opt_max: 0.15 # [新增] 能量充足时，p_opt的上限
+  p_opt_max: 0.12 # [新增] 能量充足时，p_opt的上限
   max_comm_range_increase_factor: 1.5 # 普通节点通信范围最大增加倍数
   min_ch_to_node_ratio_target: 0.05  # 目标最小CH/节点比例，低于此可能增加p_opt
   location_factor_enabled: true       # 是否启用位置因子
@@ -71,6 +72,7 @@ deec:
   location_factor_enabled: true     # 启用位置因子
   edge_penalty_factor: 0.3          # 边缘节点惩罚因子
   epoch_length: 20
+  forced_routing_epochs: 15
   msl: 
       min_ch_count_absolute: 3
       min_ch_ratio_to_alive: 0.05
@@ -119,7 +121,7 @@ visualization:
 
 q_learning:
   alpha_compete_ch: 0.1
-  gamma_compete_ch: 0.9
+  gamma_compete_ch: 0.95
   epsilon_compete_ch_initial: 0.6 # 初始探索率高一些
   epsilon_compete_ch_decay: 0.995
   epsilon_compete_ch_min: 0.01
@@ -132,7 +134,7 @@ q_learning:
   geography_reward_factor: 0.05    # 地理进展奖励的权重
   shortest_path_reward_factor: 10.0 # 全局最短路径奖励的权重
   load_penalty_factor: 20.0 # 负载惩罚的系数，值越大，CH越厌恶拥挤的下一跳
-  dynamic_path_reward_factor: 10.0 # 新的路径奖励因子
+  dynamic_path_reward_factor: 20.0 # 新的路径奖励因子
   congestion_penalty_factor: 5.0
   reputation_threshold: 0.5
   reputation_penalty_weight: 0.5
@@ -143,7 +145,10 @@ q_learning:
     max_energy_budget_per_round_for_tx: 0.1 # CH每轮最多使用其当前能量的10%用于发送
     max_packets_per_round_absolute: 5      # CH每轮最多发送的绝对数据包数量上限
     min_members_threshold: 3 # CH的最低成员数要求（不含自己）。设为0表示只处理光杆司令。可以设为3或5。
-  # 可以为普通节点选择CH的Q学习也添加类似参数
+  
+  ch_flow_control:
+    q_value_factor: 2.0  # Q值在决策中的影响权重
+    congestion_penalty_factor: 5.0 # 下一跳拥塞度的惩罚权重
 
 rewards:
   ch_competition: # 竞争成为CH的基础奖励/惩罚值
@@ -173,6 +178,7 @@ rewards:
     next_hop_low_energy_penalty_unit: -20
     next_hop_high_load_penalty_unit: -15
     reach_bs_via_direct_node_bonus: 10 # 新增：通过直连节点到达BS的奖励
+    island_penalty: -50.0 # 对有路可选却不选的“孤岛”行为的惩罚
 
   select_ch:
     rejection_penalty: -30.0        # 当选择的CH因容量满而拒绝加入时的惩罚
@@ -203,6 +209,7 @@ discretization_params:
     boundaries: [0.2, 0.4, 0.6, 0.8]
 
 routing:
+  energy_cost_weight: 2e9 # 或者 5e9, 1e11, 这是一个实验参数
   dynamic_cost_weights:
     distance: 0.15  # 距离成本的权重
     energy: 0.4    # 能量成本的权重
@@ -210,10 +217,11 @@ routing:
     direct_bs_factor: 1.5 # [新增] 直连BS的成本惩罚因子
     gateway_hop_discount: 0.7 # [新增] 去往网关CH的路由成本折扣因子。小于1表示鼓励。
     relay_hop_discount: 0.9  # [新增] 去往常规中继CH的成本折扣
+    energy_cost_weight: 25.0
 
 # in config.yml
 pre_training:
-  enabled: true
+  enabled: false
   rounds_compete_ch: 50000
   rounds_select_ch: 20000
 

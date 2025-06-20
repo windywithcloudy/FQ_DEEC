@@ -167,7 +167,11 @@ class WSNEnv:
         self.gateway_chs_for_epoch = []
         self.regular_chs_for_epoch = []
         self.packets_in_transit = {}
-        self.ch_forwarding_buffer_size  = self.config.get('q_learning', {}).get('ch_buffer_size', 5)
+
+        self.is_intelligent_agent = True
+        self.energy_snapshot_for_epoch = {}
+        self.routing_plan_for_epoch = {}
+        self.gateway_chs_for_epoch = []
 
         deec_cfg = self.config.get('deec', {})
         self.p_opt_initial = deec_cfg.get('p_opt', 0.1) # 期望的簇头比例
@@ -199,6 +203,7 @@ class WSNEnv:
         self.ch_max_members_factor = float(ch_management_cfg.get('max_members_factor', 1.5))
         rewards_cfg = self.config.get('rewards', {}).get('select_ch', {})
         self.ch_rejection_penalty = float(rewards_cfg.get('rejection_penalty', -30.0))
+        self.ch_forwarding_buffer_size  = self.config.get('q_learning', {}).get('ch_buffer_size', 5)
         self.current_epsilon_compete = self.epsilon_compete_initial
         self.competition_log_for_current_epoch = {}
 
@@ -223,7 +228,8 @@ class WSNEnv:
         self.sim_total_delay_this_round = 0.0 # 如果计算精确时延
         self.sim_num_packets_for_delay_this_round = 0 # 如果计算精确时延
 
-
+        self.debug_mode = self.config.get('simulation', {}).get('debug_mode', False)
+        self.is_forced_routing_phase = False
         self.strategy_fuzzy_logic = CHSelectionStrategyFuzzySystem(self.config)
         # 用于计算PDR移动平均值
         self.pdr_history = [] 
@@ -313,8 +319,8 @@ class WSNEnv:
                 "gamma_compete": self.gamma_compete,
                 "epsilon_compete": self.epsilon_compete_initial, # 每个节点维护自己的epsilon
                 # ... (其他已有属性如 base_communication_range) ...
-                 "base_communication_range": network_cfg.get('communication_range', 100), 
-                 "current_communication_range": network_cfg.get('communication_range', 100) 
+                 "base_communication_range": network_cfg.get('communication_range', 150), 
+                 "current_communication_range": network_cfg.get('communication_range', 150) 
             }
             self.nodes.append(node_data)
             # logger.debug(f"已创建节点 {i}: 位置 [{pos[0]:.2f}, {pos[1]:.2f}], 能量 {initial_energy} J")
@@ -1233,8 +1239,11 @@ class WSNEnv:
 
         self._run_ch_disqualification_and_remedy_phase()
 
-        # 阶段 3: CH 选择下一跳进行路由
-        self._run_ch_routing_phase()
+         # --- [核心修改] 根据调试开关选择路由函数 ---
+        if self.debug_mode:
+            self._run_ch_routing_phase_debug()
+        else:
+            self._run_ch_routing_phase()
 
         # [*** 核心修改 ***]
         # 阶段 3.5: 验证CH路由路径的连通性
@@ -1270,7 +1279,8 @@ class WSNEnv:
         self.sim_packets_delivered_bs_this_round = 0
         self.sim_total_delay_this_round = 0.0
         self.sim_num_packets_for_delay_this_round = 0
-
+        forced_routing_epochs = self.config.get('deec', {}).get('forced_routing_epochs', 15)
+        self.is_forced_routing_phase = (self.current_round // self.epoch_length) < forced_routing_epochs
         # 在每个Epoch的第0轮，重置epoch级别的计数器
         if self.current_round % self.epoch_length == 0:
             for node in self.nodes:
@@ -1307,6 +1317,7 @@ class WSNEnv:
         [V12.0 最终版] 采用“初选-诊断-微调”三阶段选举，确保角色、分布和连通性。
         """
         logger.info(f"--- ***** 新 Epoch 开始 (轮次 {self.current_round}) ***** ---")
+        self.routing_plan_for_epoch = {}
 
         # 1. 角色洗牌与Q表更新
         # ... (这部分不变) ...
@@ -1324,6 +1335,9 @@ class WSNEnv:
             self._update_ch_competition_q_tables_at_epoch_end()
             self._update_select_ch_q_tables()
         self.confirmed_cluster_heads_previous_epoch = list(self.confirmed_cluster_heads_for_epoch)
+
+        self.energy_snapshot_for_epoch = {n['id']: n['energy'] for n in self.nodes}
+        logger.debug("已为本 Epoch 创建能量快照。")
 
         # --- [核心重构] 简化的三步流程 ---
 
@@ -1361,6 +1375,7 @@ class WSNEnv:
                 for ch_id in self.confirmed_cluster_heads_for_epoch:
                     if self.nodes[ch_id]['status'] == 'active':
                         dist = self.calculate_distance(node_data['id'], ch_id)
+                        # 核心条件：距离最近 且 在通信范围内
                         if dist < min_dist and dist <= node_data['base_communication_range']:
                             min_dist = dist
                             assigned_ch_id = ch_id
@@ -1376,16 +1391,16 @@ class WSNEnv:
 
     def _run_ch_routing_phase(self):
         """
-        [V-Final 最终版] CH路由与数据传输总指挥。
-        整合了数据交接、融合、能耗计算、动态成本路由和智能流控批量发送。
+        [智能模式 V5 - 最终重构版]
+        本版本实现了“决策与执行分离”的最终架构。
         """
-        logger.info("开始阶段 3：CH路由与数据传输...")
+        logger.info("开始阶段 3：CH路由与数据传输 [智能模式]")
         
-        # --- 阶段 1: 优雅的数据交接 ---
+        # --- 阶段 1 & 2: 数据融合 (逻辑不变) ---
+        # (这部分代码是正确的，无需修改)
         current_ch_set = set(self.confirmed_cluster_heads_for_epoch)
         for holder_id, buffer in list(self.packets_in_transit.items()):
             if holder_id not in current_ch_set and self.nodes[holder_id]["status"] == "active":
-                logger.warning(f"节点 {holder_id} 在本轮落选CH，其持有的 {len(buffer)} 个数据包需要处理。")
                 packets_remained_after_handover = []
                 for packet in buffer:
                     best_new_holder, min_dist = None, float('inf')
@@ -1393,230 +1408,77 @@ class WSNEnv:
                         if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
                         if len(self.packets_in_transit[ch_id]) < self.ch_forwarding_buffer_size:
                             dist = self.calculate_distance(holder_id, ch_id)
-                            if dist < min_dist:
-                                min_dist, best_new_holder = dist, ch_id
-                    if best_new_holder:
-                        self._add_packet_to_queue_with_aging(best_new_holder, packet)
-                    else:
-                        packets_remained_after_handover.append(packet)
-                
+                            if dist < min_dist: min_dist, best_new_holder = dist, ch_id
+                    if best_new_holder: self._add_packet_to_queue_with_aging(best_new_holder, packet)
+                    else: packets_remained_after_handover.append(packet)
                 if not packets_remained_after_handover:
-                    if holder_id in self.packets_in_transit:
-                        del self.packets_in_transit[holder_id]
-                else:
-                    self.packets_in_transit[holder_id] = packets_remained_after_handover
-                    logger.error(f"交接失败：落选CH {holder_id} 仍有 {len(packets_remained_after_handover)} 个包无法交接！网络在交接阶段已饱和。")
+                    if holder_id in self.packets_in_transit: del self.packets_in_transit[holder_id]
+                else: self.packets_in_transit[holder_id] = packets_remained_after_handover
 
-        # --- 阶段 2: CH融合数据，并计算成员->CH的传输能耗 ---
         packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
         for ch_id in self.confirmed_cluster_heads_for_epoch:
             if self.nodes[ch_id]["status"] == "active":
                 if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
-                
-                # 找到所有选择此CH的成员（包括CH自己）中，有数据待发送的
-                raw_packets_sources = [node['id'] for node in self.nodes if (node.get("cluster_id") == ch_id or node["id"] == ch_id) and node.get("has_data_to_send")]
-                
+                raw_packets_sources = [n['id'] for n in self.nodes if n.get("has_data_to_send") and (n.get("cluster_id") == ch_id or n["id"] == ch_id)]
                 if raw_packets_sources:
-                    # a. 计算成员->CH的传输能耗 (TX和RX)
                     for member_id in raw_packets_sources:
-                        if member_id != ch_id: # CH自己的数据不产生TX/RX
-                            member_node = self.nodes[member_id]
-                            dist = self.calculate_distance(member_id, ch_id)
-                            tx_energy = self.calculate_transmission_energy(dist, packet_size)
-                            member_node["pending_tx_energy"] += tx_energy
-                            member_node["tx_count"] += 1
-                            
-                            rx_energy = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
-                            self.nodes[ch_id]["pending_rx_energy"] += rx_energy
-                            self.nodes[ch_id]["rx_count"] += 1
-
-                    # b. 检查缓冲区，融合数据包并计算聚合能耗
+                        if member_id != ch_id:
+                            self.nodes[member_id]["pending_tx_energy"] += self.calculate_transmission_energy(self.calculate_distance(member_id, ch_id), packet_size)
+                            self.nodes[ch_id]["pending_rx_energy"] += self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
                     if len(self.packets_in_transit[ch_id]) < self.ch_forwarding_buffer_size:
                         uid = f"{self.current_round}-{ch_id}"
                         new_packet = {"source_ch": ch_id, "gen_round": self.current_round, "path": [ch_id], "uid": uid, "num_raw_packets": len(raw_packets_sources), "original_sources": raw_packets_sources}
                         self._add_packet_to_queue_with_aging(ch_id, new_packet)
-                        
                         agg_cost_per_bit = self.config.get('energy', {}).get('aggregation_cost_per_bit', 5e-9)
-                        total_raw_size = packet_size * len(raw_packets_sources)
-                        agg_energy = agg_cost_per_bit * total_raw_size
-                        self.nodes[ch_id]["pending_aggregation_energy"] += agg_energy
-                        
-                        # c. 标记原始数据已被处理
-                        for node_id in raw_packets_sources: 
-                            self.nodes[node_id]["has_data_to_send"] = False
-                    else:
-                        logger.warning(f"CH {ch_id} 的发送队列已满，本轮新融合的 {len(raw_packets_sources)} 个原始包被丢弃。")
-                        for node_id in raw_packets_sources:
-                            if node_id != ch_id:
-                                self.nodes[node_id]["last_epoch_choice"]['is_successful'] = False
+                        self.nodes[ch_id]["pending_aggregation_energy"] += agg_cost_per_bit * packet_size * len(raw_packets_sources)
+                        for node_id in raw_packets_sources: self.nodes[node_id]["has_data_to_send"] = False
 
-        # --- 步骤 3: [核心升级] 构建由模糊逻辑驱动的动态成本路由图 ---
-        G_ch_routing = nx.DiGraph()
-        routing_nodes = self.confirmed_cluster_heads_for_epoch
-        G_ch_routing.add_nodes_from(routing_nodes)
-        G_ch_routing.add_node(self.BS_ID)
-        
-        # 获取一些参考值
-        avg_load_for_nh_ref = self.get_alive_nodes() / len(routing_nodes) if routing_nodes else 10
-        relay_zone_radius = self.network_diagonal * 0.4 
-        for u_id in routing_nodes:
-            u_node = self.nodes[u_id]
-            if u_node["status"] != "active": continue
+       # --- 阶段 3: 全局路由规划 (每个Epoch仅执行一次) ---
+        if not self.routing_plan_for_epoch:
+            logger.info("本Epoch首次进入路由阶段，开始计算全局路由规划...")
+            G_ch_routing = nx.DiGraph()
+            routing_nodes = self.confirmed_cluster_heads_for_epoch
+            G_ch_routing.add_nodes_from(routing_nodes)
+            G_ch_routing.add_node(self.BS_ID)
             
-            # a. u -> v (v是另一个CH)
-            # 找到所有可达的邻居CH
-            candidate_neighbors = self._find_candidate_next_hops(u_id)
-            for nh_id, nh_type, dist in candidate_neighbors:
-                if nh_type != "CH": continue # 只处理CH到CH的链路
-                
-                # --- 使用模糊逻辑计算成本 ---
-                v_node = self.nodes[nh_id]
-                
-                # 准备模糊输入
-                e_v_norm = v_node["energy"] / v_node["initial_energy"] if v_node["initial_energy"] > 0 else 0
-                cost = self._get_fuzzy_routing_cost(u_id, nh_id, dist)
-                
-                # 为骨干网CH提供成本折扣
-                if self.calculate_distance_to_base_station(nh_id) <= relay_zone_radius:
-                    energy_threshold = 0.4 # 中心区域节点的能量警戒线
-                    if e_v_norm < energy_threshold:
-                        # 能量越低，惩罚越大（指数级）
-                        penalty_factor = 1.0 + 2.0 * ((energy_threshold - e_v_norm) / energy_threshold)**2
-                        cost *= penalty_factor
-                        logger.debug(f"NH {nh_id} (Central, Low Energy) cost penalized by x{penalty_factor:.2f}")
-
-                G_ch_routing.add_edge(u_id, nh_id, weight=cost)
-
-            # b. u -> BS
-            if self.calculate_distance_to_base_station(u_id) <= u_node.get("current_communication_range"):
-                dist_to_bs = self.calculate_distance_to_base_station(u_id)
-                e_cost_norm_bs = self.calculate_transmission_energy(dist_to_bs, 4000) / self.calculate_transmission_energy(u_node["current_communication_range"], 4000)
-                
-                # 模拟一个“下一跳是BS”的场景来获取模糊权重
-                fuzzy_weights_for_bs = self.ch_path_fuzzy_logic.compute_weights(
-                    current_dc_bs_neighbor=0,
-                    current_e_c_neighbor=1.0,
-                    current_load_c_actual=0,
-                    current_r_c_success=1.0,
-                    current_e_ctx_cost_normalized=np.clip(e_cost_norm_bs, 0, 1),
-                    avg_load_for_neighbor_ch=avg_load_for_nh_ref
-                )
-                cost_bs = fuzzy_weights_for_bs.get('w_path', 0.5) + \
-                        fuzzy_weights_for_bs.get('w_e_cost', 0.5)
-                
-                # 自身能量低的节点，直连成本应该更高
-                if (u_node['energy'] / u_node['initial_energy']) < 0.3:
-                    cost_bs *= 2.0
-                
-                G_ch_routing.add_edge(u_id, self.BS_ID, weight=cost_bs)
-
-        # --- 阶段 4: 计算最小成本路径 (Dijkstra) ---
-        min_costs_to_bs = {}
-        try:
-            reversed_G = G_ch_routing.reverse(copy=True)
-            min_costs_to_bs_raw = nx.single_source_dijkstra_path_length(reversed_G, self.BS_ID, weight='weight')
-            for node_id in routing_nodes: min_costs_to_bs[node_id] = min_costs_to_bs_raw.get(node_id, float('inf'))
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            for node_id in routing_nodes: min_costs_to_bs[node_id] = float('inf')
-
-        # --- 阶段 5: 批量传输决策与意图生成 ---
-        transfer_intentions = []
-        active_ch_list_sorted = sorted(routing_nodes, key=lambda cid: self.calculate_distance_to_base_station(cid), reverse=True)
-        avg_packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
-        q_cfg = self.config.get('q_learning', {}).get('ch_management', {})
-        energy_budget_ratio = q_cfg.get('max_energy_budget_per_round_for_tx', 0.1)
-        abs_max_packets = q_cfg.get('max_packets_per_round_absolute', 5)
-
-        for ch_id in active_ch_list_sorted:
-            ch_node_data = self.nodes[ch_id]
-            if not self.packets_in_transit.get(ch_id): continue
-
-            candidates_info = self._find_candidate_next_hops(ch_id)
-            path_history = self.packets_in_transit[ch_id][0].get("path", [])
-            chosen_next_hop_id = self._decide_next_hop_with_q_learning(ch_id, candidates_info, path_history, min_costs_to_bs)
+            avg_load_for_nh_ref = self.get_alive_nodes() / len(routing_nodes) if routing_nodes else 10
             
-            if chosen_next_hop_id == -100: continue
-            ch_node_data["chosen_next_hop_id"] = chosen_next_hop_id
+            for u_id in routing_nodes:
+                if self.nodes[u_id]["status"] != "active": continue
+                candidate_neighbors = self._find_candidate_next_hops(u_id)
+                for nh_id, nh_type, dist in candidate_neighbors:
+                    if nh_type == "CH":
+                        # 使用我们最终的、平衡的成本函数
+                        cost = self._get_fuzzy_routing_cost(u_id, nh_id, dist, use_dynamic_load=False)
+                        G_ch_routing.add_edge(u_id, nh_id, weight=cost)
+                    elif nh_type == "BS":
+                        # 直连BS的成本计算逻辑
+                        u_node = self.nodes[u_id]
+                        e_cost_norm_bs = self.calculate_transmission_energy(dist, 4000) / self.calculate_transmission_energy(u_node["base_communication_range"], 4000)
+                        fuzzy_weights = self.ch_path_fuzzy_logic.compute_weights(
+                            current_dc_bs_neighbor=0, current_e_c_neighbor=1.0, current_load_c_actual=0,
+                            current_r_c_success=1.0, current_e_ctx_cost_normalized=np.clip(e_cost_norm_bs, 0, 1),
+                            avg_load_for_neighbor_ch=avg_load_for_nh_ref)
+                        cost_bs = fuzzy_weights.get('w_path', 0.5) + fuzzy_weights.get('w_e_cost', 0.5)
+                        if (self.energy_snapshot_for_epoch.get(u_id, u_node['energy']) / u_node['initial_energy']) < 0.3:
+                            cost_bs *= 2.0
+                        G_ch_routing.add_edge(u_id, nh_id, weight=cost_bs)
+            try:
+                reversed_G = G_ch_routing.reverse(copy=True)
+                # 我们只需要路径规划，不再需要为Q-learning决策提供成本字典
+                paths = nx.single_source_dijkstra_path(reversed_G, self.BS_ID, weight='weight')
+                self.routing_plan_for_epoch = {s: p[-2] for s, p in paths.items() if s != self.BS_ID and len(p) > 1}
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                logger.warning("Dijkstra在规划路由时未能找到路径。")
+                self.routing_plan_for_epoch = {}
 
-            dist_to_nh = self.calculate_distance(ch_id, chosen_next_hop_id) if chosen_next_hop_id != self.BS_ID else self.calculate_distance_to_base_station(ch_id)
-            energy_per_packet_tx = self.calculate_transmission_energy(dist_to_nh, avg_packet_size)
-            
-            energy_budget = ch_node_data["energy"] * energy_budget_ratio
-            max_packets_by_energy = int(energy_budget / energy_per_packet_tx) if energy_per_packet_tx > 0 else 0
+        # --- [最终架构] 阶段 4: 强制执行路由规划 ---
+        active_ch_list = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"]
+        for ch_id in active_ch_list:
+            # 无论何时，CH的下一跳都严格来自于本Epoch的固定规划
+            self.nodes[ch_id]["chosen_next_hop_id"] = self.routing_plan_for_epoch.get(ch_id, self.NO_PATH_ID)
 
-            # -----------【层级一优化：背压流控】-----------
-            available_slots_in_nh = float('inf')
-            backpressure_factor = 1.0 # 1.0表示无压力
-
-            if chosen_next_hop_id != self.BS_ID:
-                nh_buffer = self.packets_in_transit.get(chosen_next_hop_id, [])
-                available_slots_in_nh = self.ch_forwarding_buffer_size - len(nh_buffer)
-                
-                nh_node = self.nodes[chosen_next_hop_id]
-                nh_energy_level = nh_node['energy'] / nh_node['initial_energy']
-                nh_buffer_occupancy = len(nh_buffer) / self.ch_forwarding_buffer_size
-                
-                # 如果下一跳自己都找不到路，施加最大背压
-                # .get的第二个参数是默认值，以防chosen_next_hop_id还未被设置
-                if nh_node.get("chosen_next_hop_id", self.NO_PATH_ID) == self.NO_PATH_ID and self.calculate_distance_to_base_station(chosen_next_hop_id) > nh_node['current_communication_range']:
-                    congestion_index = 1.0
-                else:
-                    congestion_index = (nh_buffer_occupancy + (1.0 - nh_energy_level)) / 2.0
-                
-                backpressure_factor = max(0, 1.0 - congestion_index)
-
-            num_packets_in_buffer = len(self.packets_in_transit[ch_id])
-            max_packets_by_backpressure = int(abs_max_packets * backpressure_factor)
-            num_packets_to_send = max(0, min(
-                num_packets_in_buffer,          # 限制1：不能超过自己有的
-                max_packets_by_energy,          # 限制2：不能超过能量预算
-                available_slots_in_nh,          # 限制3：不能超过下游容量
-                max_packets_by_backpressure,    # 限制4：不能超过考虑了背压的上限
-                abs_max_packets                 # 限制5：绝对不能超过配置的上限（例如5）
-            ))
-
-            if num_packets_to_send > 0:
-                # 从缓冲区头部取出要发送的数据包批次
-                packet_batch = self.packets_in_transit[ch_id][:num_packets_to_send]
-                # 将这个传输意图（谁发，发给谁，发什么）加入列表
-                transfer_intentions.append((ch_id, chosen_next_hop_id, packet_batch))
-            logger.debug(f"CH {ch_id} -> NH {chosen_next_hop_id}: Backpressure={backpressure_factor:.2f}, NumToSend={num_packets_to_send}")
-            # -----------【修改结束】-----------
-
-        # --- 阶段 6: 批量传输执行与冲突处理 ---
-        delivery_attempts = {}
-        for sender_id, receiver_id, packet_batch in transfer_intentions:
-            if receiver_id not in delivery_attempts: delivery_attempts[receiver_id] = []
-            delivery_attempts[receiver_id].append((sender_id, packet_batch))
-
-        for receiver_id, attempts in delivery_attempts.items():
-            if receiver_id == self.BS_ID:
-                for sender_id, packet_batch in attempts:
-                    self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
-                continue
-            
-            sorted_attempts = sorted(attempts, key=lambda item: self.nodes[item[0]]["energy"], reverse=True)
-            available_slots = self.ch_forwarding_buffer_size - len(self.packets_in_transit.get(receiver_id, []))
-            
-            for sender_id, packet_batch in sorted_attempts:
-                if len(packet_batch) <= available_slots:
-                    self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
-                    available_slots -= len(packet_batch)
-                else:
-                    self._penalize_failed_routing_action(sender_id, receiver_id)
-
-        # --- 阶段 7: 清理和更新Epsilon ---
-        for holder_id, buffer in list(self.packets_in_transit.items()):
-            if self.nodes[holder_id]["status"] == "dead":
-                del self.packets_in_transit[holder_id]
-
-        for ch_id in self.confirmed_cluster_heads_for_epoch:
-            if self.nodes[ch_id]["status"] == "active":
-                min_eps = self.config.get('q_learning',{}).get('epsilon_ch_hop_min',0.01)
-                decay = self.config.get('q_learning',{}).get('epsilon_ch_hop_decay_per_round',0.998)
-                current_eps = self.nodes[ch_id].get("epsilon_select_next_hop", self.config.get('q_learning',{}).get('epsilon_ch_hop_initial',0.2))
-                self.nodes[ch_id]["epsilon_select_next_hop"] = max(min_eps, current_eps * decay)
-
+        self._execute_routing_and_transmission()
 
     def _apply_energy_consumption(self):
         """在每轮结束时，统一扣除所有暂存的能量，并计算背景能耗。"""
@@ -1635,111 +1497,6 @@ class WSNEnv:
                 )
                 if total_cost_this_round > 0:
                     self.consume_node_energy(node["id"], total_cost_this_round)
-
-    def _decide_next_hop_with_q_learning(self, ch_id, candidates_info, path_history, min_costs_to_bs):
-        ch_node_data = self.nodes[ch_id]
-        
-        # ... (自适应Epsilon的计算逻辑保持不变) ...
-        base_epsilon = ch_node_data.get("epsilon_select_next_hop", 0.2)
-        energy_level = ch_node_data["energy"] / ch_node_data["initial_energy"] if ch_node_data["initial_energy"] > 0 else 0
-        buffer_load = len(self.packets_in_transit.get(ch_id, [])) / self.ch_forwarding_buffer_size if self.ch_forwarding_buffer_size > 0 else 0
-        adaptive_epsilon = base_epsilon * min(1.0, (energy_level / 0.5)) * (1.0 - buffer_load)
-
-        q_cfg = self.config.get('q_learning', {})
-        q_factor = q_cfg.get('q_value_factor', 1.0)
-        path_reward_factor = q_cfg.get('dynamic_path_reward_factor', 10.0)
-        congestion_penalty_factor = q_cfg.get('congestion_penalty_factor', 5.0) 
-
-        # [核心修复1] 在循环外提前获取 current_cost，解决 Pylance 警告
-        current_cost = min_costs_to_bs.get(ch_id, float('inf'))
-
-        # [核心重构] 创建一个字典列表，存储每个候选者的所有决策信息
-        candidate_decision_info = []
-
-        # -----------【核心修改：动态Dijkstra影响力】-----------
-        # 1. 先计算所有候选者的原始Q值，以评估“经验丰富度”
-        original_q_values = [self.get_q_value_select_next_hop(ch_id, c[0]) for c in candidates_info if c[0] not in path_history]
-        
-        # 2. 计算Q值的标准差，作为“经验分化度”的指标
-        q_std_dev = np.std(original_q_values) if original_q_values else 0
-        
-        # 3. 动态调整Dijkstra(path_reward)的权重
-        # 如果Q值分化很小（经验不足或看法一致），则提高Dijkstra的权重；反之则降低。
-        # 使用一个sigmoid函数来平滑地调整权重
-        dijkstra_trust_factor = 1.0 - (1.0 / (1.0 + np.exp(-5 * (q_std_dev - 0.5)))) # sigmoid函数
-        
-        logger.debug(f"CH {ch_id}: Q_std_dev={q_std_dev:.3f}, Dijkstra_trust_factor={dijkstra_trust_factor:.3f}")
-        # -----------【修改结束】-----------
-        
-        for nh_id, nh_type, dist in candidates_info:
-            if nh_id in path_history:
-                continue
-            
-            q_original = self.get_q_value_select_next_hop(ch_id, nh_id)
-            next_hop_cost = min_costs_to_bs.get(nh_id, float('inf')) if nh_id != self.BS_ID else 0.0
-            
-            if current_cost == float('inf'):
-                path_reward = -10
-            else:
-                path_reward = (current_cost - next_hop_cost) * path_reward_factor * dijkstra_trust_factor
-            
-            congestion_penalty = 0.0
-            if nh_id != self.BS_ID:
-                nh_buffer = self.packets_in_transit.get(nh_id, [])
-                congestion_penalty = (len(nh_buffer) / self.ch_forwarding_buffer_size) * congestion_penalty_factor if self.ch_forwarding_buffer_size > 0 else 0
-
-            q_for_decision = (q_factor  * q_original) + path_reward - congestion_penalty
-            
-            # 将所有信息存入列表
-            candidate_decision_info.append({
-                "id": nh_id,
-                "q_decision": q_for_decision,
-                "q_base": (q_factor * q_original) + path_reward # 不含拥塞惩罚的基础分
-            })
-        
-        if not candidate_decision_info:
-            if self.calculate_distance_to_base_station(ch_id) <= ch_node_data.get("current_communication_range", ch_node_data["base_communication_range"]):
-                return self.BS_ID
-            else:
-                return self.NO_PATH_ID
-
-        # 判断当前CH是否为边缘CH
-        is_edge_ch = self.calculate_distance_to_base_station(ch_id) > (self.network_diagonal * 0.4)
-
-        # Epsilon-Greedy决策
-        if random.random() < adaptive_epsilon:
-            logger.debug(f"CH {ch_id} (adaptive_epsilon={adaptive_epsilon:.3f}) is exploring.")
-            
-            # 使用稳定的Softmax进行带权随机选择 (基于完整的决策Q值)
-            q_values = np.array([c["q_decision"] for c in candidate_decision_info])
-            
-            if q_values.size == 0 or np.isnan(q_values).any() or np.isinf(q_values).any():
-                return random.choice([c["id"] for c in candidate_decision_info])
-
-            q_values_stable = q_values - np.max(q_values)
-            temperature = 0.1 
-            exp_q = np.exp(q_values_stable / temperature)
-            sum_exp_q = np.sum(exp_q)
-            if sum_exp_q <= 0 or np.isinf(sum_exp_q):
-                return random.choice([c["id"] for c in candidate_decision_info])
-                
-            probs = exp_q / sum_exp_q
-            probs /= np.sum(probs)
-            
-            candidate_ids = [c["id"] for c in candidate_decision_info]
-            return np.random.choice(candidate_ids, p=probs)
-        else:
-            # --- 利用（Exploitation）逻辑 ---
-            if is_edge_ch:
-                # 对于边缘CH，忽略拥塞，基于 "q_base" 选择
-                logger.debug(f"Edge CH {ch_id} is making a connection-focused decision.")
-                best_candidate = max(candidate_decision_info, key=lambda c: c["q_base"])
-                return best_candidate["id"]
-            else:
-                # 对于中心CH，考虑拥塞，基于 "q_decision" 选择
-                logger.debug(f"Central CH {ch_id} is making a congestion-aware decision.")
-                best_candidate = max(candidate_decision_info, key=lambda c: c["q_decision"])
-                return best_candidate["id"]
 
 
     def _update_and_log_performance_metrics(self):
@@ -2448,70 +2205,57 @@ class WSNEnv:
         dy = node['position'][1] - point_coords[1]
         return math.sqrt(dx*dx + dy*dy)
     
+
     def _elect_chs_with_global_suppression(self):
         """
-        一个更简单的选举函数：计算所有节点的候选分数，然后通过拓扑抑制选出分布均匀的CH。
+        [V4 - 最终平衡版] 选举算法。
+        在保证CH均匀分布的前提下，适度地偏爱中心和连接性好的节点。
         """
         nodes_for_election = [n for n in self.nodes if n["status"] == "active"]
         if not nodes_for_election: return []
 
-        # 1. 计算全局理想CH总数 (这部分逻辑可以复用)
-        total_ideal_ch_count = self._calculate_ideal_ch_count() # 将计算逻辑封装成一个函数
-
-        # 2. 计算所有候选节点的分数
+        total_ideal_ch_count = self._calculate_ideal_ch_count()
+        
         scores = {}
-        reputation_threshold = self.config.get('q_learning', {}).get('reputation_threshold', 0.5)
-        penalty_weight = self.config.get('q_learning', {}).get('reputation_penalty_weight', 0.5)
-        normal_nodes = [n for n in self.nodes if n['status'] == 'active' and n['role'] == 'normal']
-        num_raters = len(normal_nodes)
+        center_pos = (self.config['network']['area_size'][0] / 2, self.config['network']['area_size'][1] / 2)
+        avg_energy = self._calculate_current_average_energy()
+
         for node in nodes_for_election:
             node_id = node['id']
-            # 使用一个综合评分，例如：能量(50%) + 轮换(30%) + Q值(20%)
+            # 1. 基础分 (自身素质)
             energy_score = node["energy"] / node["initial_energy"]
             rotation_score = min(node["time_since_last_ch"] / (self.epoch_length * 2.0), 1.0)
-            q_advantage = 0
-            state_tuple = self.get_discrete_state_tuple_for_competition(node_id)
-            if state_tuple:
-                q0 = self.get_q_value_compete_ch(node_id, state_tuple, 0)
-                q1 = self.get_q_value_compete_ch(node_id, state_tuple, 1)
-                q_advantage = q1 - q0
-            # 基础分 = 能量(50%) + 轮换(30%) + Q竞争(20%)
-            base_score = 0.5 * energy_score + 0.3 * rotation_score + 0.2 * q_advantage
-
-            # b. 计算节点的“平均口碑分”
-            total_reputation_score = 0
-            if num_raters > 0:
-                for rater_node in normal_nodes:
-                    # 获取评价者(rater_node)对候选人(node_id)的评价
-                    total_reputation_score += self.get_q_value_select_ch(rater_node['id'], node_id)
-                avg_reputation_score = total_reputation_score / num_raters
-            else:
-                avg_reputation_score = 0.5 # 如果没有普通节点，给一个中性分
             
-            # c. 计算口碑惩罚
-            reputation_penalty = 0.0
-            if avg_reputation_score < reputation_threshold:
-                # 口碑越差，惩罚因子越大 (0到1之间)
-                penalty_factor = (reputation_threshold - avg_reputation_score) / reputation_threshold
-                # 惩罚值 = 基础分 * 惩罚因子 * 惩罚权重(例如50%)
-                reputation_penalty = base_score * penalty_factor * penalty_weight
+            # 2. 拓扑位置分 (引力中心)
+            dist_to_center = self.calculate_distance_to_point(node_id, center_pos)
+            position_score = 1.0 - (dist_to_center / (self.network_diagonal / 2))
             
-            # d. 计算最终分数
-            scores[node_id] = base_score - reputation_penalty
+            # --- [最终平衡] 调整权重，降低位置分的影响，避免过度集中 ---
+            # 权重: 能量(60%), 轮换(20%), 位置(20%)
+            # 我们不再单独计算连通性分，因为拓扑抑制会保证分散，从而间接保证连通潜力
+            final_score = (0.7 * energy_score + 
+                           0.15 * rotation_score +
+                           0.15 * position_score)
+            
+            scores[node['id']] = final_score
         
-        # 3. 全局拓扑抑制选举
-        suppression_factor = self.config.get('deec', {}).get('ch_election', {}).get('suppression_factor', 0.5)
+        # --- [关键回归] 重新启用并强化拓扑抑制选举 ---
+        # 拓扑抑制是保证CH在全网分散的关键，我们必须保留它
+        suppression_factor = self.config.get('deec', {}).get('suppression_factor', 0.5)
         elected_chs = []
         potential_candidates = dict(scores)
+
         while len(elected_chs) < total_ideal_ch_count and potential_candidates:
             best_id = max(potential_candidates, key=lambda k:potential_candidates[k])
             elected_chs.append(best_id)
             del potential_candidates[best_id]
             
-            # 抑制邻居
+            # 抑制其邻居
+            # 使用一个合理的抑制半径，比如基础通信范围
             neighbors_to_suppress = self.get_node_neighbors(best_id, self.nodes[best_id]["base_communication_range"])
             for neighbor_id in neighbors_to_suppress:
                 if neighbor_id in potential_candidates:
+                    # 抑制分数，而不是直接删除，这更柔和
                     potential_candidates[neighbor_id] *= suppression_factor
         
         return elected_chs
@@ -2520,6 +2264,21 @@ class WSNEnv:
         """
         [新增] 使用高阶模糊逻辑，计算出本轮网络理想的CH总数。
         """
+
+        # --- [核心修改 2] 新手保护期 ---
+        initial_epoch_grace_period = self.config.get('deec', {}).get('initial_epoch_grace_period', 5)
+        if (self.current_round // self.epoch_length) < initial_epoch_grace_period:
+            self.p_opt_current = self.p_opt_initial
+            num_alive_eligible = len([n for n in self.nodes if n["status"] == "active"])
+            total_ideal_ch_count = int(num_alive_eligible * self.p_opt_current)
+            logger.info(
+                f"新手保护期 (Epoch < {initial_epoch_grace_period}): "
+                f"强制使用 p_opt_initial: {self.p_opt_initial:.3f} "
+                f"=> 理想CH总数: {total_ideal_ch_count}"
+            )
+            return total_ideal_ch_count
+        # --- 保护期逻辑结束 ---
+
         num_alive_eligible = len([n for n in self.nodes if n["status"] == "active"])
         if num_alive_eligible == 0:
             return 0
@@ -2527,7 +2286,6 @@ class WSNEnv:
         # 1. 获取输入模糊控制器的各项网络指标
         pdr_ma = self.get_pdr_moving_average()
         avg_energy_norm = self._calculate_current_average_energy() / self.E0
-        # getattr 用于安全地获取属性，如果上个epoch没有计算，则返回默认值0.0
         isolated_rate = getattr(self, 'isolated_node_rate_last_epoch', 0.0)
         congestion = getattr(self, 'congestion_level_last_epoch', 0.0)
 
@@ -2560,6 +2318,92 @@ class WSNEnv:
         return total_ideal_ch_count
 
 
+    def _execute_routing_and_transmission(self):
+        """
+        [V1.0] 一个通用的路由执行函数。
+        它基于已经为每个CH设置好的 'chosen_next_hop_id' 来执行数据传输、
+        流控和Q值更新（如果适用）。所有算法子类都应调用此函数来保证执行逻辑的统一。
+        """
+        # --- 智能流量调度与传输意图生成 ---
+        transfer_intentions = []
+        active_ch_list = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"]
+        active_ch_list_sorted = sorted(active_ch_list, key=lambda cid: self.calculate_distance_to_base_station(cid), reverse=True)
+        
+        q_cfg_flow = self.config.get('q_learning', {}).get('ch_flow_control', {})
+        energy_budget_ratio = q_cfg_flow.get('max_energy_budget_per_round_for_tx', 0.1)
+        abs_max_packets = q_cfg_flow.get('max_packets_per_round_absolute', 5)
+        q_value_factor = q_cfg_flow.get('q_value_factor', 2.0)
+        congestion_penalty_factor = q_cfg_flow.get('congestion_penalty_factor', 5.0)
+
+        for ch_id in active_ch_list_sorted:
+            if not self.packets_in_transit.get(ch_id): continue
+            
+            chosen_next_hop_id = self.nodes[ch_id]["chosen_next_hop_id"]
+            if chosen_next_hop_id == self.NO_PATH_ID: continue
+
+            # FQ-DEEC/Q-DEEC 使用智能流控，HEED/DEEC 使用简化流控
+            # 通过检查算法特定的配置或一个特殊的标志位来区分
+            # 为简单起见，我们假设HEED/DEEC没有 ch_flow_control 配置
+            #is_intelligent_flow = bool(q_cfg_flow) and not isinstance(self, WSNEnvHEED) # 示例：通过类名判断
+            is_intelligent_flow = getattr(self, 'is_intelligent_agent', False) and bool(q_cfg_flow)
+            intelligent_factor = 1.0
+            if is_intelligent_flow and chosen_next_hop_id != self.BS_ID:
+                q_value_to_nh = self.get_q_value_select_next_hop(ch_id, chosen_next_hop_id)
+                nh_node = self.nodes[chosen_next_hop_id]
+                nh_buffer_occupancy = len(self.packets_in_transit.get(chosen_next_hop_id, [])) / self.ch_forwarding_buffer_size
+                sending_desire = (q_value_factor * q_value_to_nh) - (congestion_penalty_factor * nh_buffer_occupancy)
+                intelligent_factor = 1.0 / (1.0 + np.exp(-sending_desire))
+
+            max_packets_by_intelligence = int(abs_max_packets * intelligent_factor)
+
+            dist_to_nh = self.calculate_distance(ch_id, chosen_next_hop_id) if chosen_next_hop_id != self.BS_ID else self.calculate_distance_to_base_station(ch_id)
+            energy_per_packet_tx = self.calculate_transmission_energy(dist_to_nh, 4000)
+            max_packets_by_energy = int(self.nodes[ch_id]["energy"] * energy_budget_ratio / energy_per_packet_tx) if energy_per_packet_tx > 0 else 0
+            available_slots_in_nh = self.ch_forwarding_buffer_size - len(self.packets_in_transit.get(chosen_next_hop_id, [])) if chosen_next_hop_id != self.BS_ID else float('inf')
+            
+            num_packets_to_send = max(0, min(
+                len(self.packets_in_transit[ch_id]), 
+                max_packets_by_energy, 
+                available_slots_in_nh, 
+                max_packets_by_intelligence if is_intelligent_flow else abs_max_packets
+            ))
+
+            if num_packets_to_send > 0:
+                transfer_intentions.append((ch_id, chosen_next_hop_id, self.packets_in_transit[ch_id][:num_packets_to_send]))
+
+        # --- 批量传输执行与冲突处理 ---
+        delivery_attempts = {}
+        for sender_id, receiver_id, packet_batch in transfer_intentions:
+            if receiver_id not in delivery_attempts: delivery_attempts[receiver_id] = []
+            delivery_attempts[receiver_id].append((sender_id, packet_batch))
+        
+        for receiver_id, attempts in delivery_attempts.items():
+            if receiver_id == self.BS_ID:
+                for sender_id, packet_batch in attempts: self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
+                continue
+            
+            sorted_attempts = sorted(attempts, key=lambda item: self.nodes[item[0]]["energy"], reverse=True)
+            available_slots = self.ch_forwarding_buffer_size - len(self.packets_in_transit.get(receiver_id, []))
+            
+            for sender_id, packet_batch in sorted_attempts:
+                if len(packet_batch) <= available_slots:
+                    self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
+                    available_slots -= len(packet_batch)
+                else:
+                    self._penalize_failed_routing_action(sender_id, receiver_id)
+
+        # --- 清理和更新Epsilon ---
+        for holder_id, buffer in list(self.packets_in_transit.items()):
+            if self.nodes[holder_id]["status"] == "dead": del self.packets_in_transit[holder_id]
+        
+        if not self.is_forced_routing_phase and getattr(self, 'is_intelligent_agent', False):
+            for ch_id in self.confirmed_cluster_heads_for_epoch:
+                if self.nodes[ch_id]["status"] == "active":
+                    min_eps = self.config.get('q_learning',{}).get('epsilon_ch_hop_min',0.01)
+                    decay = self.config.get('q_learning',{}).get('epsilon_ch_hop_decay_per_round',0.998)
+                    current_eps = self.nodes[ch_id].get("epsilon_select_next_hop", self.config.get('q_learning',{}).get('epsilon_ch_hop_initial',0.2))
+                    self.nodes[ch_id]["epsilon_select_next_hop"] = max(min_eps, current_eps * decay)
+
     def _run_ch_disqualification_and_remedy_phase(self):
         """
         [V-Final 8.0] 协调与补救阶段：罢免不合格CH并重新安置受影响的节点。
@@ -2581,11 +2425,13 @@ class WSNEnv:
             if len(members) <= self.ch_min_members_threshold:
                 disqualified_chs.append(ch_id)
                 
+                # 罢免CH
                 ch_node = self.nodes[ch_id]
                 ch_node['role'] = 'normal'
                 ch_node['cluster_id'] = -1
                 nodes_needing_reassignment.append(ch_node)
                 
+                # 解散其成员
                 for member_node in members:
                     member_node['cluster_id'] = -1
                     nodes_needing_reassignment.append(member_node)
@@ -2594,9 +2440,11 @@ class WSNEnv:
             logger.info("所有CH均合格，无需处理。")
             return
 
+        # 更新本轮的权威CH列表
         self.confirmed_cluster_heads_for_epoch = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if ch_id not in disqualified_chs]
         logger.info(f"共取消了 {len(disqualified_chs)} 个CH的资格。开始为 {len(nodes_needing_reassignment)} 个节点重新分配...")
 
+        # 为受影响的节点重新寻找CH
         num_reassigned = 0
         for node_data in nodes_needing_reassignment:
             min_dist = float('inf')
@@ -2633,30 +2481,278 @@ class WSNEnv:
             current_ch_to_bs_dis_normalized=ch_to_bs_dis_normalized
         )
 
-
-    def _get_fuzzy_routing_cost(self, u_id, v_id, dist):
-        """[新辅助函数] 获取CH路由的模糊成本。"""
+    def _get_fuzzy_routing_cost(self, u_id, v_id, dist, use_dynamic_load=True):
+        """
+        [V3.1 - 最终生产版] 计算CH路由的模糊成本。
+        本版本在模糊调节的基础上，强力加入了与传输能耗成正比的成本项，
+        并修复了从config加载参数时的类型转换问题。
+        """
         u_node = self.nodes[u_id]
         v_node = self.nodes[v_id]
         
+        # --- 1. 计算模糊权重 ---
         avg_load_for_nh_ref = self.get_alive_nodes() / len(self.confirmed_cluster_heads_for_epoch) if self.confirmed_cluster_heads_for_epoch else 10
-        
-        e_v_norm = v_node["energy"] / v_node["initial_energy"] if v_node["initial_energy"] > 0 else 0
-        load_v_actual = len(self.packets_in_transit.get(v_id, []))
+        load_v_actual = len(self.packets_in_transit.get(v_id, [])) if use_dynamic_load else 0
+        energy_at_epoch_start = self.energy_snapshot_for_epoch.get(v_id, v_node['energy'])
+        e_v_norm = energy_at_epoch_start / v_node["initial_energy"] if v_node["initial_energy"] > 0 else 0
         r_success_norm = u_node.get("history_success_with_nh", {}).get(v_id, 0.9)
-        e_cost_norm = self.calculate_transmission_energy(dist, 4000) / self.calculate_transmission_energy(u_node["current_communication_range"], 4000)
+        e_cost_norm_fuzzy_input = self.calculate_transmission_energy(dist, 4000) / self.calculate_transmission_energy(u_node["base_communication_range"], 4000)
         
         fuzzy_weights = self.ch_path_fuzzy_logic.compute_weights(
             current_dc_bs_neighbor=self.calculate_distance_to_base_station(v_id),
             current_e_c_neighbor=e_v_norm,
             current_load_c_actual=load_v_actual,
             current_r_c_success=r_success_norm,
-            current_e_ctx_cost_normalized=np.clip(e_cost_norm, 0, 1),
+            current_e_ctx_cost_normalized=np.clip(e_cost_norm_fuzzy_input, 0, 1),
             avg_load_for_neighbor_ch=avg_load_for_nh_ref
         )
         
-        cost = fuzzy_weights.get('w_path', 0.5) + \
-               fuzzy_weights.get('w_e_cost', 0.5) + \
-               fuzzy_weights.get('w_load_neighbor', 0.5) + \
-               (1 - fuzzy_weights.get('w_fur', 0.5))
-        return cost
+        # --- 2. 计算最终组合成本 ---
+        
+        # a. 基础成本 = 物理距离
+        base_cost = dist
+
+        # b. 模糊调节器，反映了下一跳的“健康度”
+        cost_modifier = (
+            (1 + fuzzy_weights.get('w_e_cost', 1.0) - 1.0) +
+            (1 + fuzzy_weights.get('w_load_neighbor', 1.0) - 1.0) +
+            (1 - (fuzzy_weights.get('w_fur', 1.0) - 1.0))
+        )
+        modified_dist_cost = base_cost * max(0.1, cost_modifier)
+
+        # c. 明确的、独立的传输能耗成本项
+        tx_energy_to_v = self.calculate_transmission_energy(dist, 4000)
+
+        # d. [核心修复] 从config获取权重，并强制转换为float类型
+        energy_cost_weight = float(self.config.get('routing', {}).get('energy_cost_weight', 1e8))
+        
+        # e. 最终成本 = 修正后的距离成本 + 加权后的能耗成本
+        final_cost = modified_dist_cost + energy_cost_weight * tx_energy_to_v
+        
+        return final_cost
+    
+
+    def _get_routing_cost(self, u_id, v_id, dist):
+        """
+        [诊断模式] 计算路由成本，直接使用物理距离。
+        """
+        # 为了让距离近的成本低，可以直接返回距离
+        # 也可以返回一个考虑了能量的简单组合
+        # 为了最小化变量，我们先只用距离
+        
+        # 我们可以稍微考虑一下能量，避免选到快死的节点
+        v_node = self.nodes[v_id]
+        # 使用Epoch快照能量，确保稳定性
+        energy_at_epoch_start = self.energy_snapshot_for_epoch.get(v_id, v_node['energy'])
+        
+        # 能量越低，成本越高。设计一个惩罚因子。
+        # 当能量为100%时，因子为1。当能量为0时，因子极大。
+        energy_penalty = 1 / (energy_at_epoch_start / v_node['initial_energy']) if energy_at_epoch_start > 0 else float('inf')
+
+        return dist * energy_penalty
+    
+
+    def _run_ch_routing_phase_debug(self):
+        """
+        [诊断模式] CH路由与数据传输。
+        路由成本被极度简化为物理距离，路由决策被Dijkstra完全接管。
+        用于验证核心拓扑构建和路由执行的健壮性。
+        """
+        logger.info("开始阶段 3：CH路由与数据传输 [诊断模式]")
+        
+        # --- 阶段 1 & 2 (数据交接与融合) 保持不变 ---
+        current_ch_set = set(self.confirmed_cluster_heads_for_epoch)
+        for holder_id, buffer in list(self.packets_in_transit.items()):
+            if holder_id not in current_ch_set and self.nodes[holder_id]["status"] == "active":
+                logger.warning(f"节点 {holder_id} 在本轮落选CH，其持有的 {len(buffer)} 个数据包需要处理。")
+                packets_remained_after_handover = []
+                for packet in buffer:
+                    best_new_holder, min_dist = None, float('inf')
+                    for ch_id in current_ch_set:
+                        if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
+                        if len(self.packets_in_transit[ch_id]) < self.ch_forwarding_buffer_size:
+                            dist = self.calculate_distance(holder_id, ch_id)
+                            if dist < min_dist:
+                                min_dist, best_new_holder = dist, ch_id
+                    if best_new_holder:
+                        self._add_packet_to_queue_with_aging(best_new_holder, packet)
+                    else:
+                        packets_remained_after_handover.append(packet)
+                
+                if not packets_remained_after_handover:
+                    if holder_id in self.packets_in_transit:
+                        del self.packets_in_transit[holder_id]
+                else:
+                    self.packets_in_transit[holder_id] = packets_remained_after_handover
+                    logger.error(f"交接失败：落选CH {holder_id} 仍有 {len(packets_remained_after_handover)} 个包无法交接！网络在交接阶段已饱和。")
+
+        packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
+        for ch_id in self.confirmed_cluster_heads_for_epoch:
+            if self.nodes[ch_id]["status"] == "active":
+                if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
+                
+                raw_packets_sources = [node['id'] for node in self.nodes if (node.get("cluster_id") == ch_id or node["id"] == ch_id) and node.get("has_data_to_send")]
+                
+                if raw_packets_sources:
+                    for member_id in raw_packets_sources:
+                        if member_id != ch_id:
+                            member_node = self.nodes[member_id]
+                            dist = self.calculate_distance(member_id, ch_id)
+                            tx_energy = self.calculate_transmission_energy(dist, packet_size)
+                            member_node["pending_tx_energy"] += tx_energy
+                            member_node["tx_count"] += 1
+                            
+                            rx_energy = self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+                            self.nodes[ch_id]["pending_rx_energy"] += rx_energy
+                            self.nodes[ch_id]["rx_count"] += 1
+
+                    if len(self.packets_in_transit[ch_id]) < self.ch_forwarding_buffer_size:
+                        uid = f"{self.current_round}-{ch_id}"
+                        new_packet = {"source_ch": ch_id, "gen_round": self.current_round, "path": [ch_id], "uid": uid, "num_raw_packets": len(raw_packets_sources), "original_sources": raw_packets_sources}
+                        self._add_packet_to_queue_with_aging(ch_id, new_packet)
+                        
+                        agg_cost_per_bit = self.config.get('energy', {}).get('aggregation_cost_per_bit', 5e-9)
+                        total_raw_size = packet_size * len(raw_packets_sources)
+                        agg_energy = agg_cost_per_bit * total_raw_size
+                        self.nodes[ch_id]["pending_aggregation_energy"] += agg_energy
+                        
+                        for node_id in raw_packets_sources: 
+                            self.nodes[node_id]["has_data_to_send"] = False
+                    else:
+                        logger.warning(f"CH {ch_id} 的发送队列已满，本轮新融合的 {len(raw_packets_sources)} 个原始包被丢弃。")
+                        for node_id in raw_packets_sources:
+                            if node_id != ch_id:
+                                self.nodes[node_id]["last_epoch_choice"]['is_successful'] = False
+        
+        # --- 步骤 3 [诊断模式]: 构建基于物理距离的路由图 ---
+        if not self.routing_plan_for_epoch:
+            logger.info("本Epoch首次进入路由阶段，开始计算全局路由规划...")
+            G_ch_routing = nx.DiGraph()
+            routing_nodes = self.confirmed_cluster_heads_for_epoch
+            G_ch_routing.add_nodes_from(routing_nodes)
+            G_ch_routing.add_node(self.BS_ID)
+            
+            for u_id in routing_nodes:
+                if self.nodes[u_id]["status"] != "active": continue
+                
+                candidate_neighbors = self._find_candidate_next_hops(u_id)
+                for nh_id, nh_type, dist in candidate_neighbors:
+                    cost = dist  # 成本就是物理距离
+                    
+                    # 为了稳定性，可以给快死的节点一个巨大的成本惩罚
+                    if nh_type == "CH":
+                        v_node = self.nodes[nh_id]
+                        energy_at_start = self.energy_snapshot_for_epoch.get(nh_id, v_node['energy'])
+                        if energy_at_start < 0.05 * v_node['initial_energy']: # 如果能量低于5%
+                            cost *= 100 # 成本乘以100，使其几乎不可能被选中
+                    
+                    G_ch_routing.add_edge(u_id, nh_id, weight=cost)
+
+            # --- 阶段 4 [诊断模式]: 计算并存储Dijkstra路径 ---
+            try:
+                reversed_G = G_ch_routing.reverse(copy=True)
+                paths = nx.single_source_dijkstra_path(reversed_G, self.BS_ID, weight='weight')
+                
+                temp_routing_plan = {} # 使用一个临时字典
+                for source_node, path_list in paths.items():
+                    if source_node != self.BS_ID and len(path_list) > 1:
+                        temp_routing_plan[source_node] = path_list[-2]
+                
+                # --- [终极修复] ---
+                # 将本轮计算出的路由规划，存入类的属性中，供整个Epoch使用！
+                self.routing_plan_for_epoch = temp_routing_plan
+
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                logger.warning("Dijkstra [诊断模式] 无法找到路径，本Epoch路由规划为空。")
+                # 确保在失败时，它也是一个空字典
+                self.routing_plan_for_epoch = {}
+
+       # --- [核心修复] 阶段 5.1: 更新所有CH的路由状态 (拓扑状态更新) ---
+        active_ch_list = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"]
+        for ch_id in active_ch_list:
+            # 无论有没有数据，都必须为其设置下一跳，这样拓扑图才能正确显示
+            next_hop = self.routing_plan_for_epoch.get(ch_id, self.NO_PATH_ID)
+            self.nodes[ch_id]["chosen_next_hop_id"] = next_hop
+
+        # --- 阶段 5.2: 为有数据的CH生成传输意图 (数据传输决策) ---
+        transfer_intentions = []
+        active_ch_list_sorted = sorted(active_ch_list, key=lambda cid: self.calculate_distance_to_base_station(cid), reverse=True)
+        # ... (批量传输参数设置不变) ...
+        avg_packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
+        q_cfg = self.config.get('q_learning', {}).get('ch_management', {})
+        energy_budget_ratio = q_cfg.get('max_energy_budget_per_round_for_tx', 0.1)
+        abs_max_packets = q_cfg.get('max_packets_per_round_absolute', 5)
+
+        for ch_id in active_ch_list_sorted:
+            # 只处理有数据要发送的CH
+            if not self.packets_in_transit.get(ch_id): 
+                continue
+            
+            # 此处直接使用已经设置好的下一跳
+            chosen_next_hop_id = self.nodes[ch_id]["chosen_next_hop_id"]
+            
+            if chosen_next_hop_id == self.NO_PATH_ID: 
+                continue
+
+
+            # 后续的流控和批量传输逻辑不变
+            dist_to_nh = self.calculate_distance(ch_id, chosen_next_hop_id) if chosen_next_hop_id != self.BS_ID else self.calculate_distance_to_base_station(ch_id)
+            energy_per_packet_tx = self.calculate_transmission_energy(dist_to_nh, avg_packet_size)
+            energy_budget = self.nodes[ch_id]["energy"] * energy_budget_ratio
+            max_packets_by_energy = int(energy_budget / energy_per_packet_tx) if energy_per_packet_tx > 0 else 0
+            available_slots_in_nh = float('inf')
+            backpressure_factor = 1.0
+            if chosen_next_hop_id != self.BS_ID:
+                nh_buffer = self.packets_in_transit.get(chosen_next_hop_id, [])
+                available_slots_in_nh = self.ch_forwarding_buffer_size - len(nh_buffer)
+                nh_node = self.nodes[chosen_next_hop_id]
+                nh_energy_level = nh_node['energy'] / nh_node['initial_energy'] if nh_node['initial_energy'] > 0 else 0
+                nh_buffer_occupancy = len(nh_buffer) / self.ch_forwarding_buffer_size if self.ch_forwarding_buffer_size > 0 else 0
+                if nh_node.get("chosen_next_hop_id", self.NO_PATH_ID) == self.NO_PATH_ID and self.calculate_distance_to_base_station(chosen_next_hop_id) > nh_node['current_communication_range']:
+                    congestion_index = 1.0
+                else:
+                    congestion_index = (nh_buffer_occupancy + (1.0 - nh_energy_level)) / 2.0
+                backpressure_factor = max(0, 1.0 - congestion_index)
+            num_packets_in_buffer = len(self.packets_in_transit[ch_id])
+            max_packets_by_backpressure = int(abs_max_packets * backpressure_factor)
+            num_packets_to_send = max(0, min(
+                num_packets_in_buffer,
+                max_packets_by_energy,
+                available_slots_in_nh,
+                max_packets_by_backpressure,
+                abs_max_packets
+            ))
+
+            if num_packets_to_send > 0:
+                packet_batch = self.packets_in_transit[ch_id][:num_packets_to_send]
+                transfer_intentions.append((ch_id, chosen_next_hop_id, packet_batch))
+            logger.debug(f"CH {ch_id} -> NH {chosen_next_hop_id}: Backpressure={backpressure_factor:.2f}, NumToSend={num_packets_to_send}")
+
+        # --- 阶段 6 & 7 (批量传输执行、清理) 保持不变 ---
+        delivery_attempts = {}
+        for sender_id, receiver_id, packet_batch in transfer_intentions:
+            if receiver_id not in delivery_attempts: delivery_attempts[receiver_id] = []
+            delivery_attempts[receiver_id].append((sender_id, packet_batch))
+
+        for receiver_id, attempts in delivery_attempts.items():
+            if receiver_id == self.BS_ID:
+                for sender_id, packet_batch in attempts:
+                    self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
+                continue
+            
+            sorted_attempts = sorted(attempts, key=lambda item: self.nodes[item[0]]["energy"], reverse=True)
+            available_slots = self.ch_forwarding_buffer_size - len(self.packets_in_transit.get(receiver_id, []))
+            
+            for sender_id, packet_batch in sorted_attempts:
+                if len(packet_batch) <= available_slots:
+                    self._execute_successful_batch_transfer(sender_id, receiver_id, packet_batch)
+                    available_slots -= len(packet_batch)
+                else:
+                    self._penalize_failed_routing_action(sender_id, receiver_id)
+
+        for holder_id, buffer in list(self.packets_in_transit.items()):
+            if self.nodes[holder_id]["status"] == "dead":
+                del self.packets_in_transit[holder_id]
+
+        # 在诊断模式下，我们不更新Q-learning的epsilon，因为没有用到它
+        # for ch_id in self.confirmed_cluster_heads_for_epoch: ...

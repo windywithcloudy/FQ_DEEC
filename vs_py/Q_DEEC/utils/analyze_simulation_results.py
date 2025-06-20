@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-import numpy as np # <--- [核心修正] 添加这一行
+import numpy as np # 保留numpy
 import logging
 import shutil
 
@@ -59,6 +59,7 @@ def plot_comparison_charts(df_all):
         return
 
     # --- 1. 网络生命周期对比 (存活节点数) ---
+    # (此部分无需修改)
     plt.figure(figsize=(12, 7))
     sns.lineplot(data=df_all, x='round', y='alive_nodes', hue='algorithm', lw=2)
     plt.title('Network life cycle comparison: number of surviving nodes', fontsize=16)
@@ -70,6 +71,7 @@ def plot_comparison_charts(df_all):
     logger.info("已绘制：网络生命周期对比图")
 
     # --- 2. 平均能量消耗对比 ---
+    # (此部分无需修改)
     plt.figure(figsize=(12, 7))
     sns.lineplot(data=df_all, x='round', y='avg_energy', hue='algorithm', lw=2)
     plt.title('Comparison of average node energy consumption', fontsize=16)
@@ -80,25 +82,37 @@ def plot_comparison_charts(df_all):
     plt.close()
     logger.info("已绘制：平均能量消耗对比图")
 
-    # --- 3. 数据包投递率 (PDR) 对比 ---
-    # 计算每个算法的滑动平均PDR，使曲线更平滑
-    df_all['pdr_this_round'] = df_all['packets_to_bs'] / df_all['packets_generated'].replace(0, np.nan)
-    df_all['pdr_ma'] = df_all.groupby('algorithm')['pdr_this_round'].transform(lambda x: x.rolling(window=50, min_periods=1).mean())
+    # --- [核心修改] 3. 累计数据包投递率 (Cumulative PDR) 对比 ---
     
+    # 首先，我们需要计算每个算法随时间变化的累计生成包数和累计接收包数
+    # 使用 groupby 和 cumsum() 函数可以轻松实现
+    df_all['packets_generated_cumulative'] = df_all.groupby('algorithm')['packets_generated'].cumsum()
+    df_all['packets_to_bs_cumulative'] = df_all.groupby('algorithm')['packets_to_bs'].cumsum()
+
+    # 然后，计算累计PDR
+    # 使用 .replace(0, np.nan) 来避免除以零的错误，pandas在计算时会自动忽略NaN值
+    df_all['pdr_cumulative'] = df_all['packets_to_bs_cumulative'] / df_all['packets_generated_cumulative'].replace(0, np.nan)
+
     plt.figure(figsize=(12, 7))
-    sns.lineplot(data=df_all, x='round', y='pdr_ma', hue='algorithm', lw=2)
-    plt.title('Packet delivery rate comparison (50 rounds of sliding average)', fontsize=16)
+    # 绘图时，y轴直接使用我们新计算的 'pdr_cumulative' 列
+    sns.lineplot(data=df_all, x='round', y='pdr_cumulative', hue='algorithm', lw=2)
+    # 更新图表标题和Y轴标签，以反映新的指标
+    plt.title('Cumulative Packet Delivery Rate (PDR) Comparison', fontsize=16)
     plt.xlabel('Simulation rounds (Round)', fontsize=12)
-    plt.ylabel('PDR (sliding average)', fontsize=12)
-    plt.ylim(0, 1.1)
+    plt.ylabel('Cumulative PDR', fontsize=12)
+    # Y轴的范围现在可以严格限制在[0, 1]，因为累计PDR不可能超过1
+    plt.ylim(0, 1.0)
     plt.legend(title='algorithm')
-    plt.savefig(OUTPUT_ANALYSIS_DIR / "comparison_pdr.png", dpi=150)
+    plt.savefig(OUTPUT_ANALYSIS_DIR / "comparison_cumulative_pdr.png", dpi=150) # 保存为新文件名
     plt.close()
-    logger.info("已绘制：数据包投递率对比图")
+    logger.info("已绘制：[新] 累计数据包投递率对比图")
+
 
     # --- 4. 簇头数量对比 ---
+    # (此部分无需修改)
     plt.figure(figsize=(12, 7))
-    sns.lineplot(data=df_all, x='round', y='num_ch', hue='algorithm', lw=2, alpha=0.8)
+    # 使用 drawstyle='steps-post' 可以让阶梯图更清晰地反映CH数量在每个epoch的变化
+    sns.lineplot(data=df_all, x='round', y='num_ch', hue='algorithm', lw=1.5, drawstyle='steps-post', alpha=0.9)
     plt.title('Comparison of cluster head quantity changes', fontsize=16)
     plt.xlabel('Simulation rounds (Round)', fontsize=12)
     plt.ylabel('Number of cluster heads', fontsize=12)
@@ -123,6 +137,19 @@ def main_analysis():
     all_perf_data = load_all_performance_data(REPORTS_BASE_DIR)
     
     if not all_perf_data.empty:
+        # 为了安全，给 performance_log.csv 的列重命名，确保它们是可预测的
+        # 这是个好习惯，防止 env.py 中日志头变化导致脚本出错
+        expected_columns = [
+            'round', 'alive_nodes', 'total_energy', 'avg_energy', 
+            'num_ch', 'avg_ch_energy', 'avg_members', 'ch_load_variance', 
+            'packets_generated', 'packets_to_bs', 'avg_delay'
+        ]
+        # 假设你的日志文件没有列头，或者你想强制使用这些列名
+        # all_perf_data.columns = expected_columns 
+        # 如果你的日志文件有列头，但你想确保它们没有前后空格
+        all_perf_data.columns = [col.strip() for col in all_perf_data.columns]
+
+
         plot_comparison_charts(all_perf_data)
     else:
         logger.error("未能加载任何实验数据，分析结束。")

@@ -98,7 +98,7 @@ def run_simulation(config_file, output_dir_name, algorithm_name):
                 logger.info("配置文件中未启用预训练，跳过此阶段。")
 
         total_rounds = environment.config.get('simulation', {}).get('total_rounds', 5000)
-        viz_interval = environment.config.get('visualization', {}).get('update_interval', 20)
+        viz_interval = environment.config.get('visualization', {}).get('update_interval',500)
 
         # 7. 运行仿真主循环
         for r in range(total_rounds):

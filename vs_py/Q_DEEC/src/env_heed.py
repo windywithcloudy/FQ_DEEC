@@ -14,6 +14,7 @@ class WSNEnvHEED(WSNEnv):
     """
     def __init__(self, config_path=None, performance_log_path=None, ch_behavior_log_path=None):
         super().__init__(config_path, performance_log_path, ch_behavior_log_path)
+        self.is_intelligent_agent = False
         logger.info("="*20)
         logger.info("HEED 环境已初始化。将使用基于能量和通信成本的迭代选举逻辑。")
         logger.info("="*20)
@@ -126,7 +127,61 @@ class WSNEnvHEED(WSNEnv):
                 # 在HEED选举中，my_final_ch已经确定了归属
                 node['cluster_id'] = node.get('my_final_ch', -1)
 
+    # in env_heed.py -> class WSNEnvHEED
+
     def _run_ch_routing_phase(self):
-        """重写CH路由阶段，使用简化的地理路由。"""
-        # 这部分逻辑可以与env_deec.py中的实现保持一致
-        super()._run_ch_routing_phase()
+        """
+        [HEED专用 V3 - 最终修复版]
+        先用贪婪地理原则决策，然后调用父类的通用执行框架。
+        """
+        # --- 阶段1 & 2 (数据融合) - 保持不变 ---
+        # (这部分代码是正确的，无需修改)
+        packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
+        for ch_id in self.confirmed_cluster_heads_for_epoch:
+            if self.nodes[ch_id]["status"] == "active":
+                if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
+                members = [n for n in self.nodes if n.get("cluster_id") == ch_id and n.get("has_data_to_send")]
+                if not members and not self.nodes[ch_id].get("has_data_to_send"): continue
+                for member_node in members:
+                    if member_node['id'] != ch_id:
+                        dist = self.calculate_distance(member_node['id'], ch_id)
+                        member_node["pending_tx_energy"] += self.calculate_transmission_energy(dist, packet_size)
+                        self.nodes[ch_id]["pending_rx_energy"] += self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+                num_raw_packets = len(members) + (1 if self.nodes[ch_id].get("has_data_to_send") else 0)
+                if num_raw_packets > 0:
+                    new_packet = {
+                        "gen_round": self.current_round, 
+                        "num_raw_packets": num_raw_packets,
+                        "path": [ch_id]  # 添加初始路径
+                    }
+                    self.packets_in_transit[ch_id].append(new_packet)
+                    for node in members: node["has_data_to_send"] = False
+                    if self.nodes[ch_id].get("has_data_to_send"): self.nodes[ch_id]["has_data_to_send"] = False
+
+        # --- HEED的决策阶段 ---
+        logger.debug("HEED开始贪婪地理路由决策...")
+        active_ch_list = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"]
+        for ch_id in active_ch_list:
+            my_dist_to_bs = self.calculate_distance_to_base_station(ch_id)
+            best_next_hop = self.BS_ID # 默认下一跳是BS
+            min_dist_to_bs_of_nh = my_dist_to_bs
+            
+            # 使用基础通信范围进行决策，更符合HEED原始意图
+            neighbors = self.get_node_neighbors(ch_id, self.nodes[ch_id]["base_communication_range"])
+            
+            for neighbor_id in neighbors:
+                if neighbor_id in self.confirmed_cluster_heads_for_epoch:
+                    neighbor_dist_to_bs = self.calculate_distance_to_base_station(neighbor_id)
+                    if neighbor_dist_to_bs < min_dist_to_bs_of_nh:
+                        min_dist_to_bs_of_nh = neighbor_dist_to_bs
+                        best_next_hop = neighbor_id
+            
+            # 设置节点的决策结果
+            # 只有在找到了一个更近的邻居时，才会更新下一跳
+            if best_next_hop != self.BS_ID or self.calculate_distance_to_base_station(ch_id) <= self.nodes[ch_id]["base_communication_range"]:
+                 self.nodes[ch_id]['chosen_next_hop_id'] = best_next_hop
+            else:
+                 self.nodes[ch_id]['chosen_next_hop_id'] = self.NO_PATH_ID
+
+        # --- 调用通用的传输执行函数 ---
+        self._execute_routing_and_transmission()

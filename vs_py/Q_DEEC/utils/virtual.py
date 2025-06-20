@@ -94,32 +94,42 @@ def visualize_network(nodes_data, base_station_pos, area_dims, filename=DEFAULT_
                       linestyle='--', linewidth=0.8, color=direct_bs_color, alpha=0.7, zorder=1)
         
         # 3. 活跃CH连接到其选择的下一跳
-        if node["id"] in active_ch_ids_map: # CH也需要检查它的路由
-            chosen_next_hop_id = node.get("chosen_next_hop_id")
-            if chosen_next_hop_id is not None:
-                next_hop_pos = None
-                line_style = '-.' 
-                line_color = ch_route_color
-                line_width = 1.0
-
-                if chosen_next_hop_id == bs_id_for_routing:
-                    next_hop_pos = [base_x, base_y]
-                    line_style = '-'
-                elif 0 <= chosen_next_hop_id < len(nodes_data) and nodes_data[chosen_next_hop_id]["status"] == "active":
-                    next_hop_node_data_viz = nodes_data[chosen_next_hop_id]
-                    next_hop_pos = next_hop_node_data_viz["position"]
-                    if next_hop_node_data_viz.get("can_connect_bs_directly", False):
-                        line_color = ch_to_direct_node_route_color
-                        line_style = '--'
+        if node["id"] in active_ch_ids_map:
+            
+            # --- [最终诊断] ---
+            # 我们在这里进行最严格的检查
+            if 'chosen_next_hop_id' not in node:
+                # 如果连这个键都没有，就不画线
+                pass 
+            else:
+                chosen_next_hop_id = node["chosen_next_hop_id"]
                 
-                if next_hop_pos:
-                    plt.plot([node["position"][0], next_hop_pos[0]],
-                            [node["position"][1], next_hop_pos[1]],
-                            linestyle=line_style, 
-                            linewidth=line_width, 
-                            color=line_color,
-                            alpha=0.8, 
-                            zorder=2)
+                # 打印出我们获取到的原始值和类型
+                #logger.info(f"VIZ_CHECK @ Round {current_round}: CH {node['id']} -> chosen_next_hop_id: {chosen_next_hop_id} (type: {type(chosen_next_hop_id)})")
+
+                # 确保它是一个标准的Python整数
+                try:
+                    # 尝试将它转换为标准的int
+                    hop_id_int = int(chosen_next_hop_id)
+                except (ValueError, TypeError):
+                    # 如果转换失败，说明它不是一个有效的ID
+                    hop_id_int = -999 # 一个无效值
+
+                if hop_id_int != -999 and hop_id_int != -100: # -100是我们的NO_PATH_ID
+                    next_hop_pos = None
+                    line_style, line_color, line_width = '-.', ch_route_color, 1.0
+
+                    if hop_id_int == bs_id_for_routing:
+                        next_hop_pos = [base_x, base_y]
+                        line_style = '-'
+                    elif 0 <= hop_id_int < len(nodes_data) and nodes_data[hop_id_int]["status"] == "active":
+                        next_hop_pos = nodes_data[hop_id_int]["position"]
+                    
+                    if next_hop_pos:
+                        plt.plot([node["position"][0], next_hop_pos[0]],
+                                [node["position"][1], next_hop_pos[1]],
+                                linestyle=line_style, linewidth=line_width,
+                                color=line_color, alpha=0.8, zorder=2)
                     # (可选) 绘制箭头指示方向
                     # plt.arrow(node["position"][0], node["position"][1],
                     #           next_hop_pos[0] - node["position"][0],

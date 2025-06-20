@@ -739,8 +739,8 @@ class CHSelectionStrategyFuzzySystem:
         # --- 输入2: 网络能量储备 ---
         universe_energy = np.arange(0, 1.01, 0.01)
         self.net_energy_reserve = ctrl.Antecedent(universe_energy, 'net_energy_reserve')
-        self.net_energy_reserve['Critical'] = fuzz.zmf(self.net_energy_reserve.universe, 0.15, 0.35)
-        self.net_energy_reserve['Medium'] = fuzz.trimf(self.net_energy_reserve.universe, [0.3, 0.55, 0.8])
+        self.net_energy_reserve['Critical'] = fuzz.zmf(self.net_energy_reserve.universe, 0.15, 0.45)
+        self.net_energy_reserve['Medium'] = fuzz.trimf(self.net_energy_reserve.universe, [0.4, 0.6, 0.8])
         self.net_energy_reserve['High'] = fuzz.smf(self.net_energy_reserve.universe, 0.7, 0.9)
 
         # --- [新增] 输入3: 孤立节点率 ---
@@ -763,10 +763,10 @@ class CHSelectionStrategyFuzzySystem:
         universe_factor = np.arange(0.5, 1.51, 0.01) # 将上限从2.0降低到1.5
         self.p_opt_adjustment_factor = ctrl.Consequent(universe_factor, 'p_opt_adjustment_factor')
         
-        # “显著减少”的范围更大，效果更强
-        self.p_opt_adjustment_factor['Decrease_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.5, 0.5, 0.7])
-        # “轻微减少”的范围也更广
-        self.p_opt_adjustment_factor['Decrease_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.6, 0.8, 1.0])
+        # 让“显著减少”的范围更大，效果更强
+        self.p_opt_adjustment_factor['Decrease_Significantly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.5, 0.6, 0.75])
+        # 让“轻微减少”的范围也更广
+        self.p_opt_adjustment_factor['Decrease_Slightly'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.7, 0.85, 1.0])
         
         self.p_opt_adjustment_factor['Neutral'] = fuzz.trimf(self.p_opt_adjustment_factor.universe, [0.95, 1.0, 1.05])
         
@@ -794,17 +794,22 @@ class CHSelectionStrategyFuzzySystem:
         rule3 = ctrl.Rule(self.net_congestion_level['High'],
                         self.p_opt_adjustment_factor['Increase_Slightly'])
 
-        # 规则组3：能量权衡
+        # --- [节能优化] 规则组3：能量权衡 (规则更激进) ---
+        
         # 只有在服务质量良好(PDR Good)的情况下，才考虑根据能量进行调整
-        # 能量高，服务好 -> 维持现状
+        # 能量高，服务好 -> 轻微减少CH，从一开始就省着花
         rule4 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['High'],
-                        self.p_opt_adjustment_factor['Neutral'])
-        # 能量中等，服务好 -> 轻微减少CH，开始节能
-        rule5 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['Medium'],
                         self.p_opt_adjustment_factor['Decrease_Slightly'])
-        # 能量危急，服务好 -> 显著减少CH，全力保生存
-        rule6 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['Critical'],
+        
+        # 能量中等，服务好 -> 显著减少CH，加大节能粒度
+        rule5 = ctrl.Rule(self.net_health_pdr['Good'] & self.net_energy_reserve['Medium'],
                         self.p_opt_adjustment_factor['Decrease_Significantly'])
+        
+        # 能量危急，不管PDR怎么样，都必须全力保生存
+        # 这是一条拥有最高优先级的“否决”规则
+        rule6 = ctrl.Rule(self.net_energy_reserve['Critical'],
+                        self.p_opt_adjustment_factor['Decrease_Significantly'])
+
 
         rules.extend([rule1, rule2, rule3, rule4, rule5, rule6])
         return rules
