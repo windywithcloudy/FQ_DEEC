@@ -19,16 +19,6 @@ class WSNEnvHEED(WSNEnv):
         logger.info("HEED 环境已初始化。将使用基于能量和通信成本的迭代选举逻辑。")
         logger.info("="*20)
 
-    def _run_epoch_start_phase(self):
-        """重写Epoch开始阶段，执行完整的HEED选举流程。"""
-        logger.info(f"--- ***** 新 Epoch 开始 (轮次 {self.current_round}) - HEED模式 ***** ---")
-        
-        # 1. HEED选举逻辑
-        final_ch_ids = self._run_heed_election()
-        
-        # 2. 更新最终的CH列表和节点角色
-        self.confirmed_cluster_heads_for_epoch = final_ch_ids
-        self._update_node_roles_and_timers(self.confirmed_cluster_heads_for_epoch)
 
     def _run_heed_election(self):
         """实现经典的、迭代式的HEED簇头选举算法。"""
@@ -127,61 +117,138 @@ class WSNEnvHEED(WSNEnv):
                 # 在HEED选举中，my_final_ch已经确定了归属
                 node['cluster_id'] = node.get('my_final_ch', -1)
 
-    # in env_heed.py -> class WSNEnvHEED
+    def _run_heed_election_and_assignment(self):
+        """
+        [HEED专属-新增] 整合HEED的选举、角色更新和分配。
+        """
+        # 1. 执行HEED迭代选举
+        final_ch_ids = self._run_heed_election()
+        
+        # 2. 更新最终的CH列表和节点角色
+        self.confirmed_cluster_heads_for_epoch = final_ch_ids
+        self._update_node_roles_and_timers(self.confirmed_cluster_heads_for_epoch)
 
-    def _run_ch_routing_phase(self):
+        # 3. 分配普通节点
+        self._run_normal_node_selection_phase()
+
+    def _prepare_for_new_round(self):
         """
-        [HEED专用 V3 - 最终修复版]
-        先用贪婪地理原则决策，然后调用父类的通用执行框架。
+        [HEED专属-新增] 为新一轮做准备，重置节点状态。
         """
-        # --- 阶段1 & 2 (数据融合) - 保持不变 ---
-        # (这部分代码是正确的，无需修改)
+        self._build_spatial_index()
+        
+        self.sim_packets_generated_this_round = 0
+        self.sim_packets_delivered_bs_this_round = 0
+        self.sim_total_delay_this_round = 0.0
+        self.sim_num_packets_for_delay_this_round = 0
+
+        for node in self.nodes:
+            if node["status"] == "active":
+                # 重置HEED选举所需的状态
+                node["is_final_ch"] = False
+                node["my_final_ch"] = -1
+                node["role"] = "normal"
+                node["cluster_id"] = -1
+                # 数据包生成
+                self.sim_packets_generated_this_round += 1
+                self.sim_packets_generated_total += 1
+                node["has_data_to_send"] = True
+
+
+    def _run_heed_routing_and_energy_consumption(self):
+        """
+        [HEED专属-新增] 合并路由决策、PDR统计和能耗计算。
+        """
+        # 1. 成员向CH发送数据并计算能耗
         packet_size = self.config.get("simulation", {}).get("packet_size", 4000)
-        for ch_id in self.confirmed_cluster_heads_for_epoch:
-            if self.nodes[ch_id]["status"] == "active":
-                if ch_id not in self.packets_in_transit: self.packets_in_transit[ch_id] = []
-                members = [n for n in self.nodes if n.get("cluster_id") == ch_id and n.get("has_data_to_send")]
-                if not members and not self.nodes[ch_id].get("has_data_to_send"): continue
-                for member_node in members:
-                    if member_node['id'] != ch_id:
-                        dist = self.calculate_distance(member_node['id'], ch_id)
-                        member_node["pending_tx_energy"] += self.calculate_transmission_energy(dist, packet_size)
-                        self.nodes[ch_id]["pending_rx_energy"] += self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
-                num_raw_packets = len(members) + (1 if self.nodes[ch_id].get("has_data_to_send") else 0)
-                if num_raw_packets > 0:
-                    new_packet = {
-                        "gen_round": self.current_round, 
-                        "num_raw_packets": num_raw_packets,
-                        "path": [ch_id]  # 添加初始路径
-                    }
-                    self.packets_in_transit[ch_id].append(new_packet)
-                    for node in members: node["has_data_to_send"] = False
-                    if self.nodes[ch_id].get("has_data_to_send"): self.nodes[ch_id]["has_data_to_send"] = False
+        agg_cost_per_bit = self.config.get('energy', {}).get('aggregation_cost_per_bit', 5e-9)
+        idle_listening_cost = float(self.config.get('energy', {}).get('idle_listening_per_round', 1e-6))
+        sensing_cost = float(self.config.get('energy', {}).get('sensing_per_round', 5e-7))
 
-        # --- HEED的决策阶段 ---
-        logger.debug("HEED开始贪婪地理路由决策...")
-        active_ch_list = [ch_id for ch_id in self.confirmed_cluster_heads_for_epoch if self.nodes[ch_id]["status"] == "active"]
-        for ch_id in active_ch_list:
+        energy_costs = {node["id"]: idle_listening_cost + sensing_cost for node in self.nodes if node["status"] == "active"}
+        packets_managed_by_ch = {ch_id: 0 for ch_id in self.confirmed_cluster_heads_for_epoch}
+
+        # 成员 -> CH
+        for node in self.nodes:
+            if node['status'] == 'active' and node['role'] == 'normal' and node['cluster_id'] != -1:
+                ch_id = node['cluster_id']
+                if ch_id in packets_managed_by_ch:
+                    packets_managed_by_ch[ch_id] += 1
+                    dist = self.calculate_distance(node['id'], ch_id)
+                    energy_costs[node['id']] = energy_costs.get(node['id'], 0) + self.calculate_transmission_energy(dist, packet_size)
+                    energy_costs[ch_id] = energy_costs.get(ch_id, 0) + self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+
+        # CH自身的数据包
+        for ch_id in self.confirmed_cluster_heads_for_epoch:
+            packets_managed_by_ch[ch_id] += 1
+        
+        # 2. CH路由决策与能耗计算
+        for ch_id in self.confirmed_cluster_heads_for_epoch:
+            ch_node = self.nodes[ch_id]
+            if ch_node['status'] != 'active': continue
+
+            # 融合能耗
+            num_packets = packets_managed_by_ch.get(ch_id, 0)
+            if num_packets > 0:
+                energy_costs[ch_id] = energy_costs.get(ch_id, 0) + num_packets * agg_cost_per_bit * packet_size
+
+            # 贪婪地理路由决策
             my_dist_to_bs = self.calculate_distance_to_base_station(ch_id)
-            best_next_hop = self.BS_ID # 默认下一跳是BS
+            best_next_hop_id = self.BS_ID
             min_dist_to_bs_of_nh = my_dist_to_bs
             
-            # 使用基础通信范围进行决策，更符合HEED原始意图
-            neighbors = self.get_node_neighbors(ch_id, self.nodes[ch_id]["base_communication_range"])
-            
+            neighbors = self.get_node_neighbors(ch_id, ch_node['base_communication_range'])
             for neighbor_id in neighbors:
                 if neighbor_id in self.confirmed_cluster_heads_for_epoch:
                     neighbor_dist_to_bs = self.calculate_distance_to_base_station(neighbor_id)
                     if neighbor_dist_to_bs < min_dist_to_bs_of_nh:
                         min_dist_to_bs_of_nh = neighbor_dist_to_bs
-                        best_next_hop = neighbor_id
-            
-            # 设置节点的决策结果
-            # 只有在找到了一个更近的邻居时，才会更新下一跳
-            if best_next_hop != self.BS_ID or self.calculate_distance_to_base_station(ch_id) <= self.nodes[ch_id]["base_communication_range"]:
-                 self.nodes[ch_id]['chosen_next_hop_id'] = best_next_hop
-            else:
-                 self.nodes[ch_id]['chosen_next_hop_id'] = self.NO_PATH_ID
+                        best_next_hop_id = neighbor_id
 
-        # --- 调用通用的传输执行函数 ---
-        self._execute_routing_and_transmission()
+            # PDR统计和路由能耗计算
+            can_reach_bs = (best_next_hop_id == self.BS_ID and my_dist_to_bs <= ch_node['base_communication_range']) or (best_next_hop_id != self.BS_ID)
+            
+            if can_reach_bs:
+                if num_packets > 0:
+                    self.sim_packets_delivered_bs_this_round += num_packets
+                    self.sim_packets_delivered_bs_total += num_packets
+                
+                # 计算发送能耗
+                dist_to_nh = self.calculate_distance(ch_id, best_next_hop_id) if best_next_hop_id != self.BS_ID else my_dist_to_bs
+                energy_costs[ch_id] = energy_costs.get(ch_id, 0) + self.calculate_transmission_energy(dist_to_nh, packet_size)
+                # 计算下一跳接收能耗
+                if best_next_hop_id != self.BS_ID:
+                    energy_costs[best_next_hop_id] = energy_costs.get(best_next_hop_id, 0) + self.calculate_transmission_energy(0, packet_size, is_tx_operation=False)
+
+        # 3. 统一扣除能量
+        for node_id, cost in energy_costs.items():
+            if cost > 0:
+                self.consume_node_energy(node_id, cost)
+
+
+    def step(self, current_round_num):
+        """
+        [HEED专属-修改版] 重写 step 函数，让HEED选举每轮都发生。
+        """
+        self.current_round = current_round_num
+        logger.info(f"--- 开始第 {self.current_round} 轮 (HEED模式-逐轮选举) ---")
+
+        self._prepare_for_new_round()
+        
+        # 选举和分配
+        self._run_heed_election_and_assignment()
+
+        # 路由
+        # HEED的路由逻辑比较简单，可以合并到能耗计算中
+        self._run_heed_routing_and_energy_consumption()
+
+        # 日志
+        self._update_and_log_performance_metrics()
+        
+        logger.info(f"--- 第 {self.current_round} 轮结束 (HEED模式-逐轮选举) ---")
+        
+        if self.get_alive_nodes() == 0:
+            logger.info("HEED网络中所有节点均已死亡，仿真结束。")
+            return False
+        
+        return True

@@ -1177,7 +1177,6 @@ class WSNEnv:
         # logger.info(f"CH {ch_node_id} -> NH {chosen_next_hop_id}: Final Reward = {total_reward:.3f}")
         return total_reward
 
-# in env.py
     def update_q_value_select_next_hop(self, 
                                         ch_node_id, 
                                         chosen_next_hop_id,
@@ -2233,9 +2232,9 @@ class WSNEnv:
             # --- [最终平衡] 调整权重，降低位置分的影响，避免过度集中 ---
             # 权重: 能量(60%), 轮换(20%), 位置(20%)
             # 我们不再单独计算连通性分，因为拓扑抑制会保证分散，从而间接保证连通潜力
-            final_score = (0.7 * energy_score + 
-                           0.15 * rotation_score +
-                           0.15 * position_score)
+            final_score = (0.6 * energy_score + 
+                           0.2 * rotation_score +
+                           0.2 * position_score)
             
             scores[node['id']] = final_score
         
@@ -2271,11 +2270,11 @@ class WSNEnv:
             self.p_opt_current = self.p_opt_initial
             num_alive_eligible = len([n for n in self.nodes if n["status"] == "active"])
             total_ideal_ch_count = int(num_alive_eligible * self.p_opt_current)
-            logger.info(
-                f"新手保护期 (Epoch < {initial_epoch_grace_period}): "
-                f"强制使用 p_opt_initial: {self.p_opt_initial:.3f} "
-                f"=> 理想CH总数: {total_ideal_ch_count}"
-            )
+            #logger.info(
+            #    f"新手保护期 (Epoch < {initial_epoch_grace_period}): "
+            #    f"强制使用 p_opt_initial: {self.p_opt_initial:.3f} "
+            #    f"=> 理想CH总数: {total_ideal_ch_count}"
+            #)
             return total_ideal_ch_count
         # --- 保护期逻辑结束 ---
 
@@ -2308,12 +2307,12 @@ class WSNEnv:
         # 5. 计算出本轮理想的CH总配额，并返回
         total_ideal_ch_count = int(num_alive_eligible * self.p_opt_current)
         
-        logger.info(
-            f"高阶模糊策略决策 -> PDR_MA:{pdr_ma:.2f}, E_norm:{avg_energy_norm:.2f}, "
-            f"Iso_rate:{isolated_rate:.2f}, Congestion:{congestion:.2f} "
-            f"=> p_opt_adj_factor:{adjustment_factor:.3f}, p_opt_current:{self.p_opt_current:.3f} "
-            f"=> 理想CH总数: {total_ideal_ch_count}"
-        )
+        #logger.info(
+        #    f"高阶模糊策略决策 -> PDR_MA:{pdr_ma:.2f}, E_norm:{avg_energy_norm:.2f}, "
+        #    f"Iso_rate:{isolated_rate:.2f}, Congestion:{congestion:.2f} "
+        #    f"=> p_opt_adj_factor:{adjustment_factor:.3f}, p_opt_current:{self.p_opt_current:.3f} "
+        #    f"=> 理想CH总数: {total_ideal_ch_count}"
+        #)
         
         return total_ideal_ch_count
 

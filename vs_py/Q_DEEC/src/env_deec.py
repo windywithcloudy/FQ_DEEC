@@ -19,49 +19,29 @@ class WSNEnvDEEC(WSNEnv):
         # DEEC不需要复杂的Q表和模糊逻辑系统，但为了保持对象结构一致，我们保留这些属性
         # 在实际决策中，它们不会被使用
     
-    # in src/env_deec.py -> class WSNEnvDEEC
 
     def _prepare_for_new_round(self):
         """
-        [DEEC专属] 为新一轮做准备。
-        这个版本不重置节点角色，因为DEEC的角色在一个Epoch内是固定的。
+        [DEEC专属-修改版] 为新一轮做准备。
+        每轮开始前重置所有节点为 normal，以进行新一轮选举。
         """
         self._build_spatial_index()
         
-        # 只重置每轮的统计数据
+        # 重置每轮的统计数据
         self.sim_packets_generated_this_round = 0
         self.sim_packets_delivered_bs_this_round = 0
         self.sim_total_delay_this_round = 0.0
         self.sim_num_packets_for_delay_this_round = 0
 
-        # 在DEEC中，节点状态相对简单，我们甚至可以不在每轮重置太多东西
-        # 只需要确保数据包生成即可
-        for node in self.nodes:
-            if node["status"] == "active":
-                self.sim_packets_generated_this_round += 1
-                self.sim_packets_generated_total += 1
-                node["has_data_to_send"] = True
-
-    # in src/env_deec.py -> class WSNEnvDEEC
-
-    def _run_epoch_start_phase(self):
-        """
-        [DEEC专属] 重写Epoch开始阶段，使用原始DEEC选举逻辑。
-        """
-        logger.info(f"--- ***** 新 Epoch 开始 (轮次 {self.current_round}) - DEEC模式 ***** ---")
-        
-        # 1. 在新Epoch开始时，将所有节点重置为normal
+        # 每轮开始时，所有活跃节点都回归普通身份，准备新一轮选举
         for node in self.nodes:
             if node["status"] == "active":
                 node["role"] = "normal"
                 node["cluster_id"] = -1
+                self.sim_packets_generated_this_round += 1
+                self.sim_packets_generated_total += 1
+                node["has_data_to_send"] = True
 
-        # 2. DEEC选举逻辑
-        ch_declarations = self._run_deec_election()
-        
-        # 3. 宣告即当选，并更新角色
-        self.confirmed_cluster_heads_for_epoch = ch_declarations
-        self._update_node_roles_and_timers(ch_declarations) # 这个父类方法可以继续使用
 
     def _run_deec_election(self):
         """
@@ -297,40 +277,46 @@ class WSNEnvDEEC(WSNEnv):
 
     def step(self, current_round_num):
         """
-        [DEEC专属] 重写 step 函数，以调用DEEC的特定逻辑流程。
+        [DEEC专属-修改版] 重写 step 函数，以调用DEEC的特定逻辑流程。
+        选举和分配改为每轮执行。
         """
         self.current_round = current_round_num
-        logger.info(f"--- 开始第 {self.current_round} 轮 (DEEC模式) ---")
+        logger.info(f"--- 开始第 {self.current_round} 轮 (DEEC模式-逐轮选举) ---")
 
-        # 阶段 0: 准备工作
-        # DEEC的准备工作很简单，甚至可以在epoch开始时做
-        # 这里我们遵循父类的结构，每轮都调用
+        # 阶段 0: 准备工作 (每轮重置必要的节点状态)
         self._prepare_for_new_round()
 
-        # 阶段 1: Epoch 开始时的特殊处理 (CH 选举)
-        # 在DEEC中，选举和分配通常在一个Epoch内是固定的
-        if self.current_round % self.epoch_length == 0:
-            self._run_epoch_start_phase()
-            self._run_normal_node_selection_phase()
-        
+        # 阶段 1: 选举和分配 (每轮都执行)
+        self._run_deec_election_and_assignment()
+
         # 阶段 2: CH 选择下一跳进行路由
-        # DEEC的路由很简单，可以每轮都计算，也可以在epoch开始时计算一次
-        # 为简单起见，我们每轮都重新计算
         self._run_ch_routing_phase()
         
         # 阶段 3: 执行本轮所有暂存的能量消耗，并统计PDR
-        # 这是最关键的一步，调用我们刚刚重命名的函数
         self._apply_energy_consumption()
 
         # 阶段 4: 更新并记录本轮的性能指标
-        # 我们可以继续使用父类的这个通用日志记录函数
         self._update_and_log_performance_metrics()
         
-        logger.info(f"--- 第 {self.current_round} 轮结束 (DEEC模式) ---")
+        logger.info(f"--- 第 {self.current_round} 轮结束 (DEEC模式-逐轮选举) ---")
         
-        # 检查仿真是否应结束
         if self.get_alive_nodes() == 0:
             logger.info("DEEC网络中所有节点均已死亡，仿真结束。")
             return False
             
         return True
+    
+
+    def _run_deec_election_and_assignment(self):
+        """
+        [DEEC专属-新增] 整合了选举、角色更新和节点分配的函数。
+        """
+        # 1. DEEC选举逻辑
+        ch_declarations = self._run_deec_election()
+        
+        # 2. 宣告即当选，并更新角色
+        self.confirmed_cluster_heads_for_epoch = ch_declarations # 变量名可以不改，但它现在是本轮的CH
+        self._update_node_roles_and_timers(ch_declarations)
+
+        # 3. 普通节点分配
+        self._run_normal_node_selection_phase()
