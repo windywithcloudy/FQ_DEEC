@@ -58,9 +58,9 @@ fuzzy:
 
 # DEEC 协议参数
 deec:
-  p_opt: 0.1                # 期望的簇头百分比 (optimal percentage of CHs)
+  p_opt: 0.08                # 期望的簇头百分比 (optimal percentage of CHs)
   p_opt_min: 0.05 # [新增] 能量耗尽时，p_opt的下限
-  p_opt_max: 0.15 # [新增] 能量充足时，p_opt的上限
+  p_opt_max: 0.12 # [新增] 能量充足时，p_opt的上限
   max_comm_range_increase_factor: 1.5 # 普通节点通信范围最大增加倍数
   min_ch_to_node_ratio_target: 0.05  # 目标最小CH/节点比例，低于此可能增加p_opt
   location_factor_enabled: true       # 是否启用位置因子
@@ -209,7 +209,7 @@ discretization_params:
     boundaries: [0.2, 0.4, 0.6, 0.8]
 
 routing:
-  energy_cost_weight: 1e8 # 或者 5e9, 1e11, 这是一个实验参数
+  energy_cost_weight: 1e9 # 或者 5e9, 1e11, 这是一个实验参数
   dynamic_cost_weights:
     distance: 0.15  # 距离成本的权重
     energy: 0.4    # 能量成本的权重

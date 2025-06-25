@@ -2509,7 +2509,7 @@ class WSNEnv:
         # --- 2. 计算最终组合成本 ---
         
         # a. 基础成本 = 物理距离
-        base_cost = dist
+        base_cost = dist**2
 
         # b. 模糊调节器，反映了下一跳的“健康度”
         cost_modifier = (
